@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -190,6 +191,18 @@ func (h *MediaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, reader)
 }
 
+// BatchCacheRequest represents a request to cache multiple profile pictures
+type BatchCacheRequest struct {
+	Pubkeys []string `json:"pubkeys"`
+}
+
+// BatchCacheResponse represents the response to a batch cache request
+type BatchCacheResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Count   int    `json:"count"`
+}
+
 func main() {
 	// Load configuration
 	configPath := "./config.json"
@@ -242,9 +255,7 @@ func main() {
 		}
 
 		// Parse the request body for pubkeys
-		var request struct {
-			Pubkeys []string `json:"pubkeys"`
-		}
+		var request BatchCacheRequest
 
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -257,9 +268,10 @@ func main() {
 		// Return immediately to the client
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]string{
-			"message": "Profile caching initiated",
-			"count":   fmt.Sprintf("%d profiles queued", len(request.Pubkeys)),
+		json.NewEncoder(w).Encode(BatchCacheResponse{
+			Status:  "accepted",
+			Message: "Profile caching initiated",
+			Count:   len(request.Pubkeys),
 		})
 	})
 
@@ -417,6 +429,58 @@ func main() {
 		cacheSeconds := config.CacheExpirationDays * 24 * 60 * 60
 		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", cacheSeconds))
 		io.Copy(w, &buf)
+	})
+
+	// Handle batch caching of profile pictures from follows
+	mux.HandleFunc("/cache-follows/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Extract the pubkey from the URL
+		parts := strings.Split(r.URL.Path, "/")
+		if len(parts) < 3 {
+			http.Error(w, "Invalid URL", http.StatusBadRequest)
+			return
+		}
+		pubkey := parts[2]
+
+		// Limit parameter (default to 500)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 500
+		if limitStr != "" {
+			if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+				limit = l
+				if limit > 1000 {
+					limit = 1000 // Cap at 1000 to prevent abuse
+				}
+			}
+		}
+
+		// Start a goroutine to fetch follows and cache their profile pictures
+		go func() {
+			// Get the user's follows
+			follows, err := fetchFollows(pubkey, limit)
+			if err != nil {
+				log.Printf("Error fetching follows for %s: %v", pubkey, err)
+				return
+			}
+
+			log.Printf("Fetched %d follows for %s, caching profile pictures", len(follows), pubkey)
+			
+			// Cache profile pictures for all follows
+			fetchAndCacheProfiles(relay, storage, follows, *config)
+		}()
+
+		// Return immediately to the client
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(BatchCacheResponse{
+			Status:  "accepted",
+			Message: fmt.Sprintf("Caching profile pictures for follows of %s", pubkey),
+			Count:   limit,
+		})
 	})
 
 	// Set up the Khatru relay to handle profile metadata events
@@ -629,6 +693,66 @@ func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
 	}
 
 	return &metadata, nil
+}
+
+// fetchFollows fetches the follows of a user
+func fetchFollows(pubkey string, limit int) ([]string, error) {
+	// Get the configuration
+	config, err := LoadConfig("./config.json")
+	if err != nil {
+		log.Printf("Error loading config, using default relays: %v", err)
+		// Use default relays if config can't be loaded
+		config = &Config{
+			UpstreamRelays: []string{"wss://damus.io", "wss://primal.net", "wss://nos.lol", "wss://purplepag.es"},
+		}
+	}
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Longer timeout for fetching follows
+	defer cancel()
+
+	// Connect to relays
+	pool := nostr.NewSimplePool(ctx)
+
+	// Query for the follows (contact list)
+	filter := nostr.Filter{
+		Kinds:   []int{3}, // Kind 3 is contact list
+		Authors: []string{pubkey},
+		Limit:   1, // We only need the most recent contact list
+	}
+
+	log.Printf("Querying public relays for follows of %s", pubkey)
+	
+	// Use the proper method for the current version of go-nostr
+	filters := nostr.Filters{filter}
+	ch := pool.SubMany(ctx, config.UpstreamRelays, filters)
+	var contactList *nostr.Event
+	
+	for ev := range ch {
+		if ev.Event != nil && ev.Event.Kind == 3 {
+			if contactList == nil || ev.Event.CreatedAt > contactList.CreatedAt {
+				contactList = ev.Event
+			}
+		}
+	}
+	
+	if contactList == nil {
+		return nil, fmt.Errorf("no contact list found on public relays")
+	}
+
+	// Extract the pubkeys from the contact list
+	var follows []string
+	for _, tag := range contactList.Tags {
+		if len(tag) >= 2 && tag[0] == "p" {
+			follows = append(follows, tag[1])
+			if len(follows) >= limit {
+				break
+			}
+		}
+	}
+
+	log.Printf("Found %d follows for %s", len(follows), pubkey)
+	return follows, nil
 }
 
 // Global relay instance for access from any function

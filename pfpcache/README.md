@@ -1,78 +1,56 @@
-# Profile Picture Cache Relay
+# Khatru Profile Picture Cache Relay
 
-A specialized Nostr relay that caches profile pictures using Khatru and Blossom Media Storage.
+A Nostr relay that caches profile pictures and serves them efficiently.
+
+This relay is built on top of [Khatru](https://github.com/fiatjaf/khatru) and supports configurable upstream relays for fetching profile metadata.
 
 ## Features
 
-1. **Batch Processing**: Request caching for up to 500 follows at once
-2. **Non-blocking**: Caching happens asynchronously without blocking the UI
-3. **Progressive Loading**: Images can be displayed immediately, with caching happening in the background
-4. **Persistent Cache**: Blossom storage ensures images remain cached between sessions
-5. **Flexible URL Scheme**: The `/profile-pic/{pubkey}` endpoint makes it easy to reference images without needing to know the exact URL
+- Caches profile pictures from Nostr metadata (kind 0 events)
+- Serves cached images directly
+- Fetches profiles from configurable upstream relays if not found locally
+- Supports batch caching of profile pictures
+- Includes an example client for testing
 
-## How It Works
+## API Endpoints
 
-This relay uses Khatru as the foundation and Blossom for media storage. It provides:
+### Profile Picture
 
-1. A Nostr relay that subscribes to profile metadata events (kind 0)
-2. A media storage system that caches profile pictures
-3. HTTP endpoints for batch caching and retrieving profile pictures
-
-## Endpoints
-
-- **WebSocket**: Standard Nostr relay WebSocket endpoint at `/`
-- **NIP-11**: Standard Nostr relay information document at `/` with `Accept: application/nostr+json` header
-- **Profile Picture**: Get a profile picture at `/profile-pic/{pubkey}`
-- **Batch Cache**: Request caching of multiple profiles at `/cache-profiles` (POST)
-
-## Usage
-
-### Starting the Relay
-
-```bash
-cd pfpcache
-go run main.go
+```
+GET /profile-pic/{pubkey}
 ```
 
-The relay will start on port 8080 by default.
+Fetches and serves the profile picture for the given pubkey. If the profile picture is already cached, it will be served directly. Otherwise, it will be fetched from upstream relays, cached, and then served.
 
-### Caching Profile Pictures
+### Batch Cache
 
-To request caching of multiple profiles, send a POST request to `/cache-profiles`:
+```
+POST /batch-cache
+```
 
-```javascript
-// Example using fetch
-async function cacheProfileImages(pubkeys) {
-  const response = await fetch('http://localhost:8080/cache-profiles', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pubkeys })
-  });
-  
-  return await response.json();
+Accepts a JSON payload with a list of pubkeys to cache profile pictures for:
+
+```json
+{
+  "pubkeys": ["pubkey1", "pubkey2", "pubkey3", ...]
 }
-
-// Example usage
-cacheProfileImages([
-  'pubkey1',
-  'pubkey2',
-  // ... up to 500 pubkeys
-]);
 ```
 
-### Retrieving Profile Pictures
+This endpoint returns immediately and processes the caching in the background.
 
-To get a profile picture, use the `/profile-pic/{pubkey}` endpoint:
+### Cache Follows
 
-```html
-<img src="http://localhost:8080/profile-pic/pubkey1" alt="Profile picture" />
+```
+GET /cache-follows/{pubkey}?limit=500
 ```
 
-If the image is already cached, it will be served directly. If not, it will be fetched and cached in the background, and the request will be redirected to the original URL.
+Fetches the contact list (follows) of the given pubkey and caches profile pictures for all the follows. The `limit` parameter controls the maximum number of follows to process (default: 500, max: 1000).
+
+This endpoint returns immediately and processes the caching in the background.
 
 ## Configuration
 
-The relay can be configured by editing the `config.json` file:
+The relay can be configured via a `config.json` file:
 
 ```json
 {
@@ -82,28 +60,22 @@ The relay can be configured by editing the `config.json` file:
   "upstream_relays": [
     "wss://damus.io",
     "wss://primal.net",
-    "wss://nos.lol"
+    "wss://nos.lol",
+    "wss://purplepag.es"
   ],
   "max_concurrent": 20,
   "cache_expiration_days": 7
 }
 ```
 
-Configuration options:
+## Running
 
-- `listen_addr`: The address to listen on (default: `:8080`)
-- `database_path`: Path to the SQLite database (default: `./data/pfpcache.db`)
-- `media_cache_path`: Path to the media cache directory (default: `./data/media_cache`)
-- `upstream_relays`: List of upstream relays to connect to
-- `max_concurrent`: Maximum number of concurrent image downloads (default: 20)
-- `cache_expiration_days`: How long to cache images in days (default: 7)
+```bash
+./run.sh
+```
 
-If the config file doesn't exist, a default one will be created when the relay starts.
+This will build and start the relay on http://localhost:8080.
 
-## Implementation Details
+## Example Client
 
-- Uses SQLite for storing Nostr events
-- Uses Blossom's filesystem storage for caching images
-- Implements rate limiting for concurrent downloads
-- Handles content type detection for different image formats
-- Implements error handling and logging
+An example client is included to demonstrate how to use the profile picture endpoint. Open http://localhost:8080/profile-pic-example.html in your browser to try it out.
