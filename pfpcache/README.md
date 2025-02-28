@@ -166,7 +166,7 @@ The relay can be configured via the `config.json` file:
     "wss://purplepag.es"
   ],
   "max_concurrent": 20,
-  "cache_expiration_days": 7,
+  "cache_expiration_days": 30,
   "max_cache_size_mb": 1024,
   "lru_check_interval": 60
 }

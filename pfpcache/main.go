@@ -52,7 +52,7 @@ func LoadConfig(configPath string) (*Config, error) {
 		MediaCachePath:     "./data/media_cache",
 		UpstreamRelays:     []string{"wss://damus.io", "wss://primal.net", "wss://nos.lol", "wss://purplepag.es"},
 		MaxConcurrent:      20,
-		CacheExpirationDays: 7,
+		CacheExpirationDays: 30,
 		MaxCacheSize:       1024, // Default to 1GB
 		LRUCheckInterval:   60,   // Default to 1 hour
 	}
