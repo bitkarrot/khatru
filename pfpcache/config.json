@@ -5,7 +5,9 @@
   "upstream_relays": [
     "wss://damus.io",
     "wss://primal.net",
-    "wss://nos.lol"
+    "wss://nos.lol",
+    "wss://purplepag.es",
+    "wss://hivetalk1.nostr.com"
   ],
   "max_concurrent": 20,
   "cache_expiration_days": 7
