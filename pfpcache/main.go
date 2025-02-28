@@ -14,7 +14,6 @@ import (
 
 	"github.com/fiatjaf/eventstore/sqlite3"
 	"github.com/fiatjaf/khatru"
-	"github.com/fiatjaf/khatru/blossom"
 	"github.com/nbd-wtf/go-nostr"
 )
 
@@ -37,6 +36,115 @@ type Config struct {
 	UpstreamRelays  []string
 	MaxConcurrent   int
 	CacheExpiration time.Duration
+}
+
+// FilesystemStorage implements a simple filesystem-based storage for profile pictures
+type FilesystemStorage struct {
+	basePath string
+}
+
+// NewFilesystemStorage creates a new filesystem storage
+func NewFilesystemStorage(basePath string) *FilesystemStorage {
+	return &FilesystemStorage{
+		basePath: basePath,
+	}
+}
+
+// Store saves a file to the filesystem
+func (fs *FilesystemStorage) Store(key string, reader io.Reader) error {
+	filePath := filepath.Join(fs.basePath, key)
+	
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		return err
+	}
+	
+	// Create the file
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	
+	// Copy the content
+	_, err = io.Copy(file, reader)
+	return err
+}
+
+// Get retrieves a file from the filesystem
+func (fs *FilesystemStorage) Get(key string) (io.ReadCloser, error) {
+	filePath := filepath.Join(fs.basePath, key)
+	return os.Open(filePath)
+}
+
+// Has checks if a file exists
+func (fs *FilesystemStorage) Has(key string) bool {
+	filePath := filepath.Join(fs.basePath, key)
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+// Delete removes a file
+func (fs *FilesystemStorage) Delete(key string) error {
+	filePath := filepath.Join(fs.basePath, key)
+	return os.Remove(filePath)
+}
+
+// MediaHandler handles HTTP requests for media files
+type MediaHandler struct {
+	storage *FilesystemStorage
+}
+
+// NewMediaHandler creates a new media handler
+func NewMediaHandler(storage *FilesystemStorage) *MediaHandler {
+	return &MediaHandler{
+		storage: storage,
+	}
+}
+
+// ServeHTTP implements the http.Handler interface
+func (h *MediaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	key := r.URL.Path
+	if key == "" {
+		http.Error(w, "Missing key", http.StatusBadRequest)
+		return
+	}
+	
+	// Check if the file exists
+	if !h.storage.Has(key) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	
+	// Get the file
+	reader, err := h.storage.Get(key)
+	if err != nil {
+		http.Error(w, "Error retrieving file", http.StatusInternalServerError)
+		return
+	}
+	defer reader.Close()
+	
+	// Determine content type based on file extension
+	ext := filepath.Ext(key)
+	contentType := "application/octet-stream" // Default
+	if ext == ".jpg" || ext == ".jpeg" {
+		contentType = "image/jpeg"
+	} else if ext == ".png" {
+		contentType = "image/png"
+	} else if ext == ".gif" {
+		contentType = "image/gif"
+	} else if ext == ".webp" {
+		contentType = "image/webp"
+	}
+	
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
+	io.Copy(w, reader)
 }
 
 func main() {
@@ -73,15 +181,15 @@ func main() {
 	relay.DeleteEvent = append(relay.DeleteEvent, db.DeleteEvent)
 	relay.ReplaceEvent = append(relay.ReplaceEvent, db.ReplaceEvent)
 
-	// Initialize Blossom for media storage
-	storage := blossom.NewFilesystemStorage(config.MediaCachePath)
-	blossomHandler := blossom.NewHandler(storage)
+	// Initialize filesystem storage for media
+	storage := NewFilesystemStorage(config.MediaCachePath)
+	mediaHandler := NewMediaHandler(storage)
 
 	// Create a mux for our HTTP handlers
 	mux := http.NewServeMux()
 
-	// Register the Blossom handler for media serving
-	mux.Handle("/media/", http.StripPrefix("/media/", blossomHandler))
+	// Register the media handler for media serving
+	mux.Handle("/media/", http.StripPrefix("/media/", mediaHandler))
 
 	// Set up batch profile caching endpoint
 	mux.HandleFunc("/cache-profiles", func(w http.ResponseWriter, r *http.Request) {
@@ -233,7 +341,7 @@ func main() {
 }
 
 // fetchAndCacheProfiles fetches and caches profile pictures for a list of pubkeys
-func fetchAndCacheProfiles(relay *khatru.Relay, storage *blossom.FilesystemStorage, pubkeys []string, config Config) {
+func fetchAndCacheProfiles(relay *khatru.Relay, storage *FilesystemStorage, pubkeys []string, config Config) {
 	// Limit concurrent fetches
 	semaphore := make(chan struct{}, config.MaxConcurrent)
 	
@@ -289,7 +397,7 @@ func fetchAndCacheProfiles(relay *khatru.Relay, storage *blossom.FilesystemStora
 }
 
 // cacheProfileImage downloads and caches a profile image
-func cacheProfileImage(storage *blossom.FilesystemStorage, pubkey, pictureURL, mediaKey string) {
+func cacheProfileImage(storage *FilesystemStorage, pubkey, pictureURL, mediaKey string) {
 	log.Printf("Caching profile picture for %s: %s", pubkey, pictureURL)
 
 	// Download the image
@@ -308,7 +416,7 @@ func cacheProfileImage(storage *blossom.FilesystemStorage, pubkey, pictureURL, m
 		return
 	}
 
-	// Store the image in Blossom
+	// Store the image in our storage
 	if err := storage.Store(mediaKey, resp.Body); err != nil {
 		log.Printf("Error storing image for %s: %v", pubkey, err)
 		return
