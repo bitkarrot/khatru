@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fiatjaf/eventstore/sqlite3"
@@ -78,56 +79,78 @@ func LoadConfig(configPath string) (*Config, error) {
 	return config, nil
 }
 
-// FilesystemStorage implements a simple filesystem-based storage for profile pictures
+// FilesystemStorage is a simple filesystem-based storage implementation
 type FilesystemStorage struct {
-	basePath string
+	BaseDir string
 }
 
 // NewFilesystemStorage creates a new filesystem storage
 func NewFilesystemStorage(basePath string) *FilesystemStorage {
 	return &FilesystemStorage{
-		basePath: basePath,
+		BaseDir: basePath,
 	}
 }
 
-// Store saves a file to the filesystem
+// Has checks if a key exists in the storage
+func (fs *FilesystemStorage) Has(key string) bool {
+	path := filepath.Join(fs.BaseDir, key)
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// Get retrieves a value from the storage
+func (fs *FilesystemStorage) Get(key string) (io.ReadCloser, error) {
+	path := filepath.Join(fs.BaseDir, key)
+	return os.Open(path)
+}
+
+// Store stores a value in the storage
 func (fs *FilesystemStorage) Store(key string, reader io.Reader) error {
-	filePath := filepath.Join(fs.basePath, key)
+	path := filepath.Join(fs.BaseDir, key)
 	
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+	// Ensure the directory exists
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	
 	// Create the file
-	file, err := os.Create(filePath)
+	file, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	
-	// Copy the content
+	// Copy the data
 	_, err = io.Copy(file, reader)
 	return err
 }
 
-// Get retrieves a file from the filesystem
-func (fs *FilesystemStorage) Get(key string) (io.ReadCloser, error) {
-	filePath := filepath.Join(fs.basePath, key)
-	return os.Open(filePath)
-}
-
-// Has checks if a file exists
-func (fs *FilesystemStorage) Has(key string) bool {
-	filePath := filepath.Join(fs.basePath, key)
-	_, err := os.Stat(filePath)
-	return err == nil
-}
-
-// Delete removes a file
+// Delete removes a key from storage
 func (fs *FilesystemStorage) Delete(key string) error {
-	filePath := filepath.Join(fs.basePath, key)
-	return os.Remove(filePath)
+	path := filepath.Join(fs.BaseDir, key)
+	return os.Remove(path)
+}
+
+// PurgeDirectory removes all files in a directory
+func (fs *FilesystemStorage) PurgeDirectory(dirPath string) error {
+	fullPath := filepath.Join(fs.BaseDir, dirPath)
+	
+	// Check if directory exists
+	_, err := os.Stat(fullPath)
+	if os.IsNotExist(err) {
+		// Directory doesn't exist, nothing to purge
+		return nil
+	}
+	
+	// Remove all files in the directory
+	err = os.RemoveAll(fullPath)
+	if err != nil {
+		return err
+	}
+	
+	// Recreate the empty directory
+	return os.MkdirAll(fullPath, 0755)
 }
 
 // MediaHandler handles HTTP requests for media files
@@ -303,27 +326,45 @@ func main() {
 			}
 
 			// Check if we already have this image cached
-			cacheKey := fmt.Sprintf("profile-pic/%s", pubkey)
-			if storage.Has(cacheKey) {
+			// Try with different possible extensions
+			extensions := []string{".jpg", ".png", ".gif", ".webp"}
+			var reader io.ReadCloser
+			
+			for _, ext := range extensions {
+				cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+				if storage.Has(cacheKey) {
+					log.Printf("Found cached profile picture for %s with extension %s", pubkey, ext)
+					var err error
+					reader, err = storage.Get(cacheKey)
+					if err != nil {
+						continue
+					}
+					break
+				}
+			}
+			
+			if reader != nil {
 				log.Printf("Serving cached profile picture for %s", pubkey)
-				reader, err := storage.Get(cacheKey)
-				if err != nil {
-					http.Error(w, "Error retrieving cached image", http.StatusInternalServerError)
-					return
-				}
 				defer reader.Close()
-
-				// Determine content type based on file extension
-				ext := filepath.Ext(metadata.Picture)
+				
+				// Try to determine content type based on the file extension we found
 				contentType := "image/jpeg" // Default
-				if ext == ".png" {
-					contentType = "image/png"
-				} else if ext == ".gif" {
-					contentType = "image/gif"
-				} else if ext == ".webp" {
-					contentType = "image/webp"
+				
+				// Check all possible extensions
+				for _, ext := range extensions {
+					cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+					if storage.Has(cacheKey) {
+						if ext == ".png" {
+							contentType = "image/png"
+						} else if ext == ".gif" {
+							contentType = "image/gif"
+						} else if ext == ".webp" {
+							contentType = "image/webp"
+						}
+						break
+					}
 				}
-
+				
 				w.Header().Set("Content-Type", contentType)
 				// Cache for the number of days specified in config
 				cacheSeconds := config.CacheExpirationDays * 24 * 60 * 60
@@ -332,11 +373,50 @@ func main() {
 				return
 			}
 
-			// Cache the image in the background
-			go cacheProfileImage(storage, pubkey, metadata.Picture)
+			// If we didn't find a cached image, cache it now
+			log.Printf("Fetching profile picture for %s from %s", pubkey, metadata.Picture)
+			resp, err := http.Get(metadata.Picture)
+			if err != nil {
+				log.Printf("Error fetching profile picture: %v", err)
+				// If we can't fetch the image, redirect to the original URL
+				http.Redirect(w, r, metadata.Picture, http.StatusTemporaryRedirect)
+				return
+			}
+			defer resp.Body.Close()
 
-			// Redirect to the original URL for now
-			http.Redirect(w, r, metadata.Picture, http.StatusTemporaryRedirect)
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("Error fetching profile picture, status: %d", resp.StatusCode)
+				// If we can't fetch the image, redirect to the original URL
+				http.Redirect(w, r, metadata.Picture, http.StatusTemporaryRedirect)
+				return
+			}
+
+			// Cache the image
+			var buf bytes.Buffer
+			tee := io.TeeReader(resp.Body, &buf)
+			if err := storage.Store(fmt.Sprintf("profile-pic/%s.jpg", pubkey), tee); err != nil {
+				log.Printf("Error caching profile picture: %v", err)
+				// If we can't cache the image, redirect to the original URL
+				http.Redirect(w, r, metadata.Picture, http.StatusTemporaryRedirect)
+				return
+			}
+
+			// Determine content type based on file extension
+			ext := filepath.Ext(metadata.Picture)
+			contentType := "image/jpeg" // Default
+			if ext == ".png" {
+				contentType = "image/png"
+			} else if ext == ".gif" {
+				contentType = "image/gif"
+			} else if ext == ".webp" {
+				contentType = "image/webp"
+			}
+
+			w.Header().Set("Content-Type", contentType)
+			// Cache for the number of days specified in config
+			cacheSeconds := config.CacheExpirationDays * 24 * 60 * 60
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", cacheSeconds))
+			io.Copy(w, &buf)
 			return
 		} else {
 			event = events[0]
@@ -356,27 +436,45 @@ func main() {
 		}
 
 		// Check if we already have this image cached
-		cacheKey := fmt.Sprintf("profile-pic/%s", pubkey)
-		if storage.Has(cacheKey) {
+		// Try with different possible extensions
+		extensions := []string{".jpg", ".png", ".gif", ".webp"}
+		var reader io.ReadCloser
+		
+		for _, ext := range extensions {
+			cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+			if storage.Has(cacheKey) {
+				log.Printf("Found cached profile picture for %s with extension %s", pubkey, ext)
+				var err error
+				reader, err = storage.Get(cacheKey)
+				if err != nil {
+					continue
+				}
+				break
+			}
+		}
+		
+		if reader != nil {
 			log.Printf("Serving cached profile picture for %s", pubkey)
-			reader, err := storage.Get(cacheKey)
-			if err != nil {
-				http.Error(w, "Error retrieving cached image", http.StatusInternalServerError)
-				return
-			}
 			defer reader.Close()
-
-			// Determine content type based on file extension
-			ext := filepath.Ext(pictureURL)
+			
+			// Try to determine content type based on the file extension we found
 			contentType := "image/jpeg" // Default
-			if ext == ".png" {
-				contentType = "image/png"
-			} else if ext == ".gif" {
-				contentType = "image/gif"
-			} else if ext == ".webp" {
-				contentType = "image/webp"
+			
+			// Check all possible extensions
+			for _, ext := range extensions {
+				cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+				if storage.Has(cacheKey) {
+					if ext == ".png" {
+						contentType = "image/png"
+					} else if ext == ".gif" {
+						contentType = "image/gif"
+					} else if ext == ".webp" {
+						contentType = "image/webp"
+					}
+					break
+				}
 			}
-
+			
 			w.Header().Set("Content-Type", contentType)
 			// Cache for the number of days specified in config
 			cacheSeconds := config.CacheExpirationDays * 24 * 60 * 60
@@ -406,7 +504,7 @@ func main() {
 		// Cache the image
 		var buf bytes.Buffer
 		tee := io.TeeReader(resp.Body, &buf)
-		if err := storage.Store(cacheKey, tee); err != nil {
+		if err := storage.Store(fmt.Sprintf("profile-pic/%s.jpg", pubkey), tee); err != nil {
 			log.Printf("Error caching profile picture: %v", err)
 			// If we can't cache the image, redirect to the original URL
 			http.Redirect(w, r, pictureURL, http.StatusTemporaryRedirect)
@@ -483,6 +581,142 @@ func main() {
 		})
 	})
 
+	// Handle batch caching of profile pictures
+	mux.HandleFunc("/batch-cache", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		var request BatchCacheRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		
+		if len(request.Pubkeys) == 0 {
+			http.Error(w, "No pubkeys provided", http.StatusBadRequest)
+			return
+		}
+		
+		// Limit the number of pubkeys to process
+		if len(request.Pubkeys) > 1000 {
+			request.Pubkeys = request.Pubkeys[:1000]
+		}
+		
+		go func() {
+			fetchAndCacheProfiles(relay, storage, request.Pubkeys, *config)
+		}()
+		
+		response := BatchCacheResponse{
+			Message: fmt.Sprintf("Started caching %d profile pictures", len(request.Pubkeys)),
+			Count: len(request.Pubkeys),
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Handle cache purging
+	mux.HandleFunc("/purge-cache/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed. Use DELETE or POST.", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		// Extract the cache type from the URL
+		parts := strings.Split(r.URL.Path, "/")
+		if len(parts) < 3 {
+			http.Error(w, "Invalid URL. Use /purge-cache/all or /purge-cache/profile-pics", http.StatusBadRequest)
+			return
+		}
+		
+		cacheType := parts[2]
+		var message string
+		var err error
+		
+		switch cacheType {
+		case "all":
+			// Purge all cached media
+			err = storage.PurgeDirectory("")
+			message = "All cached media purged successfully"
+		case "profile-pics":
+			// Purge only profile pictures
+			err = storage.PurgeDirectory("profile-pic")
+			message = "Profile picture cache purged successfully"
+		default:
+			http.Error(w, "Invalid cache type. Use 'all' or 'profile-pics'", http.StatusBadRequest)
+			return
+		}
+		
+		if err != nil {
+			log.Printf("Error purging cache: %v", err)
+			http.Error(w, fmt.Sprintf("Error purging cache: %v", err), http.StatusInternalServerError)
+			return
+		}
+		
+		// Return success response
+		response := map[string]string{
+			"status": "success",
+			"message": message,
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Handle single profile picture purging
+	mux.HandleFunc("/purge-profile-pic/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed. Use DELETE or POST.", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		// Extract the pubkey from the URL
+		parts := strings.Split(r.URL.Path, "/")
+		if len(parts) < 3 {
+			http.Error(w, "Invalid URL. Use /purge-profile-pic/{pubkey}", http.StatusBadRequest)
+			return
+		}
+		
+		pubkey := parts[2]
+		if pubkey == "" {
+			http.Error(w, "Invalid pubkey", http.StatusBadRequest)
+			return
+		}
+		
+		// Try to delete profile pictures with different extensions
+		extensions := []string{".jpg", ".png", ".gif", ".webp", ""} // Empty string for legacy files without extension
+		deleted := false
+		
+		for _, ext := range extensions {
+			cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+			if storage.Has(cacheKey) {
+				err := storage.Delete(cacheKey)
+				if err != nil {
+					log.Printf("Error deleting profile picture for %s: %v", pubkey, err)
+				} else {
+					deleted = true
+					log.Printf("Deleted profile picture for %s with extension %s", pubkey, ext)
+				}
+			}
+		}
+		
+		if !deleted {
+			http.Error(w, fmt.Sprintf("No cached profile picture found for %s", pubkey), http.StatusNotFound)
+			return
+		}
+		
+		// Return success response
+		response := map[string]string{
+			"status": "success",
+			"message": fmt.Sprintf("Profile picture for %s purged successfully", pubkey),
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
 	// Set up the Khatru relay to handle profile metadata events
 	relay.OnEventSaved = append(relay.OnEventSaved, func(ctx context.Context, event *nostr.Event) {
 		if event.Kind != 0 {
@@ -534,8 +768,42 @@ func main() {
 func cacheProfileImage(storage *FilesystemStorage, pubkey, pictureURL string) error {
 	log.Printf("Caching profile picture for %s: %s", pubkey, pictureURL)
 	
-	// Create the cache key
-	cacheKey := fmt.Sprintf("profile-pic/%s", pubkey)
+	// Extract file extension from the URL
+	ext := filepath.Ext(pictureURL)
+	if ext == "" {
+		// Try to extract extension from the last path component if no extension in the URL
+		parts := strings.Split(pictureURL, "/")
+		if len(parts) > 0 {
+			lastPart := parts[len(parts)-1]
+			if strings.Contains(lastPart, ".") {
+				ext = filepath.Ext(lastPart)
+			}
+		}
+	}
+	
+	// If we still don't have an extension, try to infer from common image hosts
+	if ext == "" {
+		if strings.Contains(pictureURL, "nostr.build") {
+			// Try to extract extension from nostr.build URLs which often have format indicators
+			if strings.Contains(pictureURL, ".jpg") || strings.Contains(pictureURL, ".jpeg") {
+				ext = ".jpg"
+			} else if strings.Contains(pictureURL, ".png") {
+				ext = ".png"
+			} else if strings.Contains(pictureURL, ".gif") {
+				ext = ".gif"
+			} else if strings.Contains(pictureURL, ".webp") {
+				ext = ".webp"
+			}
+		}
+	}
+	
+	// Default to .jpg if we couldn't determine the extension
+	if ext == "" {
+		ext = ".jpg"
+	}
+	
+	// Create the cache key with extension
+	cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
 	
 	// Check if we already have this image cached
 	if storage.Has(cacheKey) {
@@ -554,61 +822,124 @@ func cacheProfileImage(storage *FilesystemStorage, pubkey, pictureURL string) er
 		return fmt.Errorf("error fetching image, status: %d", resp.StatusCode)
 	}
 	
+	// Check content type from response and adjust extension if needed
+	contentType := resp.Header.Get("Content-Type")
+	if contentType != "" && ext == ".jpg" {
+		// Only override the default extension if we're using the default
+		if contentType == "image/png" {
+			ext = ".png"
+			cacheKey = fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+		} else if contentType == "image/gif" {
+			ext = ".gif"
+			cacheKey = fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+		} else if contentType == "image/webp" {
+			ext = ".webp"
+			cacheKey = fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+		}
+	}
+	
 	// Store the image
 	if err := storage.Store(cacheKey, resp.Body); err != nil {
 		return fmt.Errorf("error storing image: %v", err)
 	}
 	
-	log.Printf("Successfully cached profile picture for %s", pubkey)
+	log.Printf("Successfully cached profile picture for %s with extension %s", pubkey, ext)
 	return nil
 }
 
 // fetchAndCacheProfiles fetches and caches profile pictures for a list of pubkeys
 func fetchAndCacheProfiles(relay *khatru.Relay, storage *FilesystemStorage, pubkeys []string, config Config) {
 	// Limit concurrent fetches
-	semaphore := make(chan struct{}, config.MaxConcurrent)
+	sem := make(chan struct{}, config.MaxConcurrent)
 	
+	// Count successful and failed fetches
+	var successCount, failCount int
+	var mu sync.Mutex // Mutex to protect the counters
+	
+	// Process each pubkey
 	for _, pubkey := range pubkeys {
-		semaphore <- struct{}{} // Acquire semaphore
+		sem <- struct{}{} // Acquire semaphore
 		
 		go func(pk string) {
-			defer func() { <-semaphore }() // Release semaphore
+			defer func() { <-sem }() // Release semaphore when done
 			
-			// Find the latest profile for this pubkey
-			filter := nostr.Filter{
+			// Check if we already have this profile picture cached
+			// Try with different possible extensions
+			extensions := []string{".jpg", ".png", ".gif", ".webp"}
+			
+			for _, ext := range extensions {
+				cacheKey := fmt.Sprintf("profile-pic/%s%s", pk, ext)
+				if storage.Has(cacheKey) {
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+					log.Printf("Profile picture for %s already cached (%d/%d)", pk, successCount+failCount, len(pubkeys))
+					return
+				}
+			}
+			
+			// Try to get the profile from local database first
+			events, err := queryEvents(relay, nostr.Filter{
 				Kinds:   []int{0},
 				Authors: []string{pk},
 				Limit:   1,
-			}
-
-			events, err := queryEvents(relay, filter)
-			if err != nil || len(events) == 0 {
-				log.Printf("No profile found for %s: %v", pk, err)
-				return
-			}
-
-			// Parse profile metadata
+			})
+			
 			var metadata ProfileMetadata
-			if err := json.Unmarshal([]byte(events[0].Content), &metadata); err != nil {
-				log.Printf("Invalid profile data for %s: %v", pk, err)
-				return
+			
+			if err != nil || len(events) == 0 {
+				// Not found locally, try public relays
+				meta, err := fetchProfileFromPublicRelays(pk)
+				if err != nil {
+					mu.Lock()
+					failCount++
+					mu.Unlock()
+					log.Printf("No profile found for %s (%d/%d)", pk, successCount+failCount, len(pubkeys))
+					return
+				}
+				metadata = *meta
+			} else {
+				// Parse the profile metadata
+				if err := json.Unmarshal([]byte(events[0].Content), &metadata); err != nil {
+					mu.Lock()
+					failCount++
+					mu.Unlock()
+					log.Printf("Invalid profile data for %s: %v (%d/%d)", pk, err, successCount+failCount, len(pubkeys))
+					return
+				}
 			}
-
+			
+			// Check if the profile has a picture URL
 			if metadata.Picture == "" {
+				mu.Lock()
+				failCount++
+				mu.Unlock()
+				log.Printf("No picture URL in profile for %s (%d/%d)", pk, successCount+failCount, len(pubkeys))
 				return
 			}
-
+			
 			// Cache the image
 			if err := cacheProfileImage(storage, pk, metadata.Picture); err != nil {
-				log.Printf("Error caching profile picture for %s: %v", pk, err)
+				mu.Lock()
+				failCount++
+				mu.Unlock()
+				log.Printf("Error caching profile picture for %s: %v (%d/%d)", pk, err, successCount+failCount, len(pubkeys))
+			} else {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+				log.Printf("Successfully cached profile picture for %s (%d/%d)", pk, successCount+failCount, len(pubkeys))
 			}
 		}(pubkey)
 	}
-
+	
 	// Wait for all goroutines to finish
 	for i := 0; i < config.MaxConcurrent; i++ {
-		semaphore <- struct{}{}
+		sem <- struct{}{}
 	}
+	
+	log.Printf("Batch caching completed: %d successful, %d failed out of %d total", 
+		successCount, failCount, len(pubkeys))
 }
 
 // queryEvents is a helper function to query events from the relay
@@ -642,11 +973,8 @@ func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
 	}
 
 	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-
-	// Connect to relays
-	pool := nostr.NewSimplePool(ctx)
 
 	// Query for the profile
 	filter := nostr.Filter{
@@ -657,36 +985,102 @@ func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
 
 	log.Printf("Querying public relays for profile of %s", pubkey)
 	
-	// Use the proper method for the current version of go-nostr
-	filters := nostr.Filters{filter}
-	ch := pool.SubMany(ctx, config.UpstreamRelays, filters)
-	var evts []*nostr.Event
-	for ev := range ch {
-		if ev.Event != nil {
-			evts = append(evts, ev.Event)
+	// Try each relay individually to avoid WaitGroup issues
+	var profileEvent *nostr.Event
+	
+	// Create a channel to receive events
+	eventChan := make(chan *nostr.Event, 1)
+	errChan := make(chan error, 1)
+	
+	// Try each relay with a timeout
+	for _, relayURL := range config.UpstreamRelays {
+		log.Printf("Checking relay %s for profile of %s", relayURL, pubkey)
+		
+		// Create a context with a shorter timeout for each relay
+		relayCtx, relayCancel := context.WithTimeout(ctx, 5*time.Second)
+		
+		go func(relayURL string) {
+			// Connect to the relay
+			relay, err := nostr.RelayConnect(relayCtx, relayURL)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to connect to %s: %v", relayURL, err)
+				relayCancel()
+				return
+			}
+			
+			// Subscribe to events
+			sub, err := relay.Subscribe(relayCtx, []nostr.Filter{filter})
+			if err != nil {
+				errChan <- fmt.Errorf("failed to subscribe to %s: %v", relayURL, err)
+				relay.Close()
+				relayCancel()
+				return
+			}
+			
+			// Process events
+			for {
+				select {
+				case ev := <-sub.Events:
+					if ev != nil && ev.Kind == 0 && ev.PubKey == pubkey {
+						eventChan <- ev
+						relay.Close()
+						relayCancel()
+						return
+					}
+				case <-sub.EndOfStoredEvents:
+					errChan <- fmt.Errorf("no profile found on %s", relayURL)
+					relay.Close()
+					relayCancel()
+					return
+				case <-relayCtx.Done():
+					errChan <- fmt.Errorf("timeout querying %s", relayURL)
+					relay.Close()
+					return
+				}
+			}
+		}(relayURL)
+		
+		// Wait for either an event or an error
+		select {
+		case profileEvent = <-eventChan:
+			log.Printf("Found profile for %s on relay %s", pubkey, relayURL)
+			relayCancel()
+			break
+		case err := <-errChan:
+			log.Printf("Error from relay %s: %v", relayURL, err)
+			relayCancel()
+			continue
+		case <-time.After(5 * time.Second):
+			log.Printf("Timeout waiting for relay %s", relayURL)
+			relayCancel()
+			continue
+		}
+		
+		if profileEvent != nil {
+			break
 		}
 	}
 	
-	if len(evts) == 0 {
-		return nil, fmt.Errorf("no profile found on public relays")
+	if profileEvent == nil {
+		return nil, fmt.Errorf("profile not found on any configured relay")
 	}
 
 	// Parse the profile metadata
 	var metadata ProfileMetadata
-	if err := json.Unmarshal([]byte(evts[0].Content), &metadata); err != nil {
-		return nil, err
+	if err := json.Unmarshal([]byte(profileEvent.Content), &metadata); err != nil {
+		return nil, fmt.Errorf("error parsing profile: %v", err)
 	}
 
-	// Store the event in our local database
-	log.Printf("Storing profile for %s in local database", pubkey)
-	
-	// Get the relay instance from the global scope
+	// Check if the profile has a picture URL
+	if metadata.Picture == "" {
+		return nil, fmt.Errorf("profile has no picture URL")
+	}
+
+	// Store the profile in our local database
 	relay, err := getRelayInstance()
-	if err != nil {
-		log.Printf("Error getting relay instance: %v", err)
-	} else {
+	if err == nil {
 		for _, storeFunc := range relay.StoreEvent {
-			if err := storeFunc(ctx, evts[0]); err != nil {
+			if err := storeFunc(ctx, profileEvent); err != nil {
 				log.Printf("Error storing event: %v", err)
 			}
 		}
@@ -695,7 +1089,7 @@ func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
 	return &metadata, nil
 }
 
-// fetchFollows fetches the follows of a user
+// fetchFollows fetches the follows for a given pubkey
 func fetchFollows(pubkey string, limit int) ([]string, error) {
 	// Get the configuration
 	config, err := LoadConfig("./config.json")
@@ -708,50 +1102,113 @@ func fetchFollows(pubkey string, limit int) ([]string, error) {
 	}
 
 	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Longer timeout for fetching follows
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Connect to relays
-	pool := nostr.NewSimplePool(ctx)
-
-	// Query for the follows (contact list)
+	// Query for the contact list
 	filter := nostr.Filter{
 		Kinds:   []int{3}, // Kind 3 is contact list
 		Authors: []string{pubkey},
-		Limit:   1, // We only need the most recent contact list
+		Limit:   1,
 	}
 
 	log.Printf("Querying public relays for follows of %s", pubkey)
 	
-	// Use the proper method for the current version of go-nostr
-	filters := nostr.Filters{filter}
-	ch := pool.SubMany(ctx, config.UpstreamRelays, filters)
-	var contactList *nostr.Event
+	// Try each relay individually to avoid WaitGroup issues
+	var contactEvent *nostr.Event
 	
-	for ev := range ch {
-		if ev.Event != nil && ev.Event.Kind == 3 {
-			if contactList == nil || ev.Event.CreatedAt > contactList.CreatedAt {
-				contactList = ev.Event
+	// Create a channel to receive events
+	eventChan := make(chan *nostr.Event, 1)
+	errChan := make(chan error, 1)
+	
+	// Try each relay with a timeout
+	for _, relayURL := range config.UpstreamRelays {
+		log.Printf("Checking relay %s for contact list of %s", relayURL, pubkey)
+		
+		// Create a context with a shorter timeout for each relay
+		relayCtx, relayCancel := context.WithTimeout(ctx, 10*time.Second)
+		
+		go func(relayURL string) {
+			// Connect to the relay
+			relay, err := nostr.RelayConnect(relayCtx, relayURL)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to connect to %s: %v", relayURL, err)
+				relayCancel()
+				return
 			}
+			
+			// Subscribe to events
+			sub, err := relay.Subscribe(relayCtx, []nostr.Filter{filter})
+			if err != nil {
+				errChan <- fmt.Errorf("failed to subscribe to %s: %v", relayURL, err)
+				relay.Close()
+				relayCancel()
+				return
+			}
+			
+			// Process events
+			for {
+				select {
+				case ev := <-sub.Events:
+					if ev != nil && ev.Kind == 3 && ev.PubKey == pubkey {
+						eventChan <- ev
+						relay.Close()
+						relayCancel()
+						return
+					}
+				case <-sub.EndOfStoredEvents:
+					errChan <- fmt.Errorf("no contact list found on %s", relayURL)
+					relay.Close()
+					relayCancel()
+					return
+				case <-relayCtx.Done():
+					errChan <- fmt.Errorf("timeout querying %s", relayURL)
+					relay.Close()
+					return
+				}
+			}
+		}(relayURL)
+		
+		// Wait for either an event or an error
+		select {
+		case contactEvent = <-eventChan:
+			log.Printf("Found contact list for %s on relay %s", pubkey, relayURL)
+			relayCancel()
+			break
+		case err := <-errChan:
+			log.Printf("Error from relay %s: %v", relayURL, err)
+			relayCancel()
+			continue
+		case <-time.After(10 * time.Second):
+			log.Printf("Timeout waiting for relay %s", relayURL)
+			relayCancel()
+			continue
+		}
+		
+		if contactEvent != nil {
+			break
 		}
 	}
 	
-	if contactList == nil {
-		return nil, fmt.Errorf("no contact list found on public relays")
+	if contactEvent == nil {
+		return nil, fmt.Errorf("contact list not found on any configured relay")
 	}
 
-	// Extract the pubkeys from the contact list
+	// Extract pubkeys from the contact list
 	var follows []string
-	for _, tag := range contactList.Tags {
+	for _, tag := range contactEvent.Tags {
 		if len(tag) >= 2 && tag[0] == "p" {
 			follows = append(follows, tag[1])
-			if len(follows) >= limit {
-				break
-			}
 		}
 	}
 
-	log.Printf("Found %d follows for %s", len(follows), pubkey)
+	log.Printf("Fetched %d follows for %s", len(follows), pubkey)
+
+	// Limit the number of follows to process
+	if limit > 0 && len(follows) > limit {
+		follows = follows[:limit]
+	}
+
 	return follows, nil
 }
 

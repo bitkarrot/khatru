@@ -1,56 +1,77 @@
 # Khatru Profile Picture Cache Relay
 
-A Nostr relay that caches profile pictures and serves them efficiently.
-
-This relay is built on top of [Khatru](https://github.com/fiatjaf/khatru) and supports configurable upstream relays for fetching profile metadata.
+A Nostr relay that caches profile pictures for fast access. It stores metadata events (kind 0) and serves profile pictures from a local cache.
 
 ## Features
 
-- Caches profile pictures from Nostr metadata (kind 0 events)
-- Serves cached images directly
-- Fetches profiles from configurable upstream relays if not found locally
-- Supports batch caching of profile pictures
-- Includes an example client for testing
+- Caches profile pictures from metadata events
+- Serves profile pictures via HTTP
+- Configurable upstream relays for fetching profiles
+- Batch caching of profile pictures
+- Cache follows of a user (contact list)
+- Cache purging endpoints
 
-## API Endpoints
+## Usage
 
-### Profile Picture
+### Starting the Relay
+
+```bash
+./run.sh
+```
+
+### Endpoints
+
+#### Profile Picture
 
 ```
 GET /profile-pic/{pubkey}
 ```
 
-Fetches and serves the profile picture for the given pubkey. If the profile picture is already cached, it will be served directly. Otherwise, it will be fetched from upstream relays, cached, and then served.
+Returns the profile picture for the given pubkey. If the profile picture is not cached, it will be fetched from the upstream relays and cached.
 
-### Batch Cache
+#### Batch Cache
 
 ```
 POST /batch-cache
 ```
 
-Accepts a JSON payload with a list of pubkeys to cache profile pictures for:
-
+Request body:
 ```json
 {
-  "pubkeys": ["pubkey1", "pubkey2", "pubkey3", ...]
+  "pubkeys": ["pubkey1", "pubkey2", ...]
 }
 ```
 
-This endpoint returns immediately and processes the caching in the background.
+Starts a background job to cache profile pictures for the given pubkeys.
 
-### Cache Follows
+#### Cache Follows
 
 ```
-GET /cache-follows/{pubkey}?limit=500
+GET /cache-follows/{pubkey}?limit=100
 ```
 
-Fetches the contact list (follows) of the given pubkey and caches profile pictures for all the follows. The `limit` parameter controls the maximum number of follows to process (default: 500, max: 1000).
+Fetches the follows (contact list) for the given pubkey and caches their profile pictures. The `limit` parameter is optional and defaults to 500.
 
-This endpoint returns immediately and processes the caching in the background.
+#### Purge Cache
+
+```
+POST /purge-cache/all
+POST /purge-cache/profile-pics
+```
+
+Purges all cached media or just profile pictures.
+
+#### Purge Single Profile Picture
+
+```
+POST /purge-profile-pic/{pubkey}
+```
+
+Purges the cached profile picture for the given pubkey.
 
 ## Configuration
 
-The relay can be configured via a `config.json` file:
+The relay can be configured via the `config.json` file:
 
 ```json
 {
