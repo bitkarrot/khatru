@@ -15,6 +15,7 @@ import (
 	"github.com/fiatjaf/eventstore/sqlite3"
 	"github.com/fiatjaf/khatru"
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
 )
 
 // ProfileMetadata represents the structure of a Nostr profile metadata (kind 0)
@@ -30,12 +31,50 @@ type ProfileMetadata struct {
 
 // Config holds the application configuration
 type Config struct {
-	ListenAddr      string
-	DatabasePath    string
-	MediaCachePath  string
-	UpstreamRelays  []string
-	MaxConcurrent   int
-	CacheExpiration time.Duration
+	ListenAddr        string   `json:"listen_addr"`
+	DatabasePath      string   `json:"database_path"`
+	MediaCachePath    string   `json:"media_cache_path"`
+	UpstreamRelays    []string `json:"upstream_relays"`
+	MaxConcurrent     int      `json:"max_concurrent"`
+	CacheExpirationDays int    `json:"cache_expiration_days"`
+}
+
+// LoadConfig loads the configuration from a file
+func LoadConfig(configPath string) (*Config, error) {
+	// Default configuration
+	config := &Config{
+		ListenAddr:        ":8080",
+		DatabasePath:      "./data/pfpcache.db",
+		MediaCachePath:    "./data/media_cache",
+		UpstreamRelays:    []string{"wss://damus.io", "wss://primal.net", "wss://nos.lol"},
+		MaxConcurrent:     20,
+		CacheExpirationDays: 7,
+	}
+
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		log.Printf("Config file not found at %s, using defaults", configPath)
+		// Save the default config for future use
+		configJSON, _ := json.MarshalIndent(config, "", "  ")
+		if err := os.WriteFile(configPath, configJSON, 0644); err != nil {
+			log.Printf("Failed to write default config: %v", err)
+		}
+		return config, nil
+	}
+
+	// Read config file
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config file: %v", err)
+	}
+
+	// Parse config
+	if err := json.Unmarshal(data, config); err != nil {
+		return nil, fmt.Errorf("error parsing config file: %v", err)
+	}
+
+	log.Printf("Loaded configuration from %s", configPath)
+	return config, nil
 }
 
 // FilesystemStorage implements a simple filesystem-based storage for profile pictures
@@ -93,12 +132,14 @@ func (fs *FilesystemStorage) Delete(key string) error {
 // MediaHandler handles HTTP requests for media files
 type MediaHandler struct {
 	storage *FilesystemStorage
+	config  *Config
 }
 
 // NewMediaHandler creates a new media handler
-func NewMediaHandler(storage *FilesystemStorage) *MediaHandler {
+func NewMediaHandler(storage *FilesystemStorage, config *Config) *MediaHandler {
 	return &MediaHandler{
 		storage: storage,
+		config:  config,
 	}
 }
 
@@ -143,19 +184,18 @@ func (h *MediaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
+	// Cache for the number of days specified in config
+	cacheSeconds := h.config.CacheExpirationDays * 24 * 60 * 60
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", cacheSeconds))
 	io.Copy(w, reader)
 }
 
 func main() {
-	// Initialize configuration
-	config := Config{
-		ListenAddr:      ":8080",
-		DatabasePath:    "./data/pfpcache.db",
-		MediaCachePath:  "./data/media_cache",
-		UpstreamRelays:  []string{"wss://relay.damus.io", "wss://relay.nostr.band", "wss://nos.lol"},
-		MaxConcurrent:   20,
-		CacheExpiration: 24 * time.Hour * 7, // Cache images for 7 days
+	// Load configuration
+	configPath := "./config.json"
+	config, err := LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
 	// Ensure directories exist
@@ -183,7 +223,7 @@ func main() {
 
 	// Initialize filesystem storage for media
 	storage := NewFilesystemStorage(config.MediaCachePath)
-	mediaHandler := NewMediaHandler(storage)
+	mediaHandler := NewMediaHandler(storage, config)
 
 	// Create a mux for our HTTP handlers
 	mux := http.NewServeMux()
@@ -209,7 +249,7 @@ func main() {
 		}
 
 		// Start fetching and caching in the background
-		go fetchAndCacheProfiles(relay, storage, request.Pubkeys, config)
+		go fetchAndCacheProfiles(relay, storage, request.Pubkeys, *config)
 
 		// Return immediately to the client
 		w.Header().Set("Content-Type", "application/json")
@@ -229,6 +269,14 @@ func main() {
 			return
 		}
 
+		// Try to normalize the pubkey if it's in npub format
+		if strings.HasPrefix(pubkey, "npub") {
+			_, decoded, err := nip19.Decode(pubkey)
+			if err == nil {
+				pubkey = decoded.(string)
+			}
+		}
+
 		// Find the latest profile for this pubkey
 		filter := nostr.Filter{
 			Kinds:   []int{0},
@@ -238,7 +286,30 @@ func main() {
 
 		events, err := queryEvents(relay, filter)
 		if err != nil || len(events) == 0 {
-			http.Error(w, "Profile not found", http.StatusNotFound)
+			// Not found locally, try fetching from public relays
+			log.Printf("Profile not found locally for %s, trying public relays", pubkey)
+			metadata, err := fetchProfileFromPublicRelays(pubkey)
+			if err != nil {
+				http.Error(w, "Profile not found", http.StatusNotFound)
+				return
+			}
+
+			pictureURL := metadata.Picture
+			if pictureURL == "" {
+				http.Error(w, "No profile picture", http.StatusNotFound)
+				return
+			}
+
+			// Create the media key
+			mediaKey := fmt.Sprintf("profile_%s%s",
+				pubkey,
+				filepath.Ext(pictureURL))
+
+			// Cache the image in the background
+			go cacheProfileImage(storage, pubkey, pictureURL, mediaKey)
+
+			// Redirect to the original URL for now
+			http.Redirect(w, r, pictureURL, http.StatusTemporaryRedirect)
 			return
 		}
 
@@ -290,7 +361,9 @@ func main() {
 		}
 
 		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
+		// Cache for the number of days specified in config
+		cacheSeconds := config.CacheExpirationDays * 24 * 60 * 60
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", cacheSeconds))
 		io.Copy(w, reader)
 	})
 
@@ -441,4 +514,53 @@ func queryEvents(relay *khatru.Relay, filter nostr.Filter) ([]*nostr.Event, erro
 	}
 
 	return events, nil
+}
+
+// fetchProfileFromPublicRelays fetches a profile from public relays
+func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
+	// Get the configuration
+	config, err := LoadConfig("./config.json")
+	if err != nil {
+		log.Printf("Error loading config, using default relays: %v", err)
+		// Use default relays if config can't be loaded
+		config = &Config{
+			UpstreamRelays: []string{"wss://damus.io", "wss://primal.net", "wss://nos.lol"},
+		}
+	}
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Connect to relays
+	pool := nostr.NewSimplePool(ctx)
+
+	// Query for the profile
+	filter := nostr.Filter{
+		Kinds:   []int{0},
+		Authors: []string{pubkey},
+		Limit:   1,
+	}
+
+	log.Printf("Querying public relays for profile of %s", pubkey)
+	evts := pool.QuerySync(ctx, config.UpstreamRelays, filter)
+	if len(evts) == 0 {
+		return nil, fmt.Errorf("no profile found on public relays")
+	}
+
+	// Parse the profile metadata
+	var metadata ProfileMetadata
+	if err := json.Unmarshal([]byte(evts[0].Content), &metadata); err != nil {
+		return nil, err
+	}
+
+	// Store the event in our local database
+	log.Printf("Storing profile for %s in local database", pubkey)
+	for _, storeFunc := range relay.StoreEvent {
+		if err := storeFunc(ctx, evts[0]); err != nil {
+			log.Printf("Error storing event: %v", err)
+		}
+	}
+
+	return &metadata, nil
 }

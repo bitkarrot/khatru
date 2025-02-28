@@ -72,14 +72,33 @@ If the image is already cached, it will be served directly. If not, it will be f
 
 ## Configuration
 
-The relay can be configured by modifying the `Config` struct in `main.go`:
+The relay can be configured by editing the `config.json` file:
 
-- `ListenAddr`: The address to listen on (default: `:8080`)
-- `DatabasePath`: Path to the SQLite database (default: `./data/pfpcache.db`)
-- `MediaCachePath`: Path to the media cache directory (default: `./data/media_cache`)
-- `UpstreamRelays`: List of upstream relays to connect to
-- `MaxConcurrent`: Maximum number of concurrent image downloads (default: 20)
-- `CacheExpiration`: How long to cache images (default: 7 days)
+```json
+{
+  "listen_addr": ":8080",
+  "database_path": "./data/pfpcache.db",
+  "media_cache_path": "./data/media_cache",
+  "upstream_relays": [
+    "wss://damus.io",
+    "wss://primal.net",
+    "wss://nos.lol"
+  ],
+  "max_concurrent": 20,
+  "cache_expiration_days": 7
+}
+```
+
+Configuration options:
+
+- `listen_addr`: The address to listen on (default: `:8080`)
+- `database_path`: Path to the SQLite database (default: `./data/pfpcache.db`)
+- `media_cache_path`: Path to the media cache directory (default: `./data/media_cache`)
+- `upstream_relays`: List of upstream relays to connect to
+- `max_concurrent`: Maximum number of concurrent image downloads (default: 20)
+- `cache_expiration_days`: How long to cache images in days (default: 7)
+
+If the config file doesn't exist, a default one will be created when the relay starts.
 
 ## Implementation Details
 

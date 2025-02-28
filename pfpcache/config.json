@@ -1,0 +1,12 @@
+{
+  "listen_addr": ":8080",
+  "database_path": "./data/pfpcache.db",
+  "media_cache_path": "./data/media_cache",
+  "upstream_relays": [
+    "wss://damus.io",
+    "wss://primal.net",
+    "wss://nos.lol"
+  ],
+  "max_concurrent": 20,
+  "cache_expiration_days": 7
+}
