@@ -10,6 +10,7 @@ A Nostr relay that caches profile pictures for fast access. It stores metadata e
 - Batch caching of profile pictures
 - Cache follows of a user (contact list)
 - Cache purging endpoints
+- LRU (Least Recently Used) cache management
 
 ## Usage
 
@@ -165,7 +166,9 @@ The relay can be configured via the `config.json` file:
     "wss://purplepag.es"
   ],
   "max_concurrent": 20,
-  "cache_expiration_days": 7
+  "cache_expiration_days": 7,
+  "max_cache_size_mb": 1024,
+  "lru_check_interval": 60
 }
 ```
 
@@ -175,6 +178,8 @@ The relay can be configured via the `config.json` file:
 - `upstream_relays`: List of Nostr relays to fetch profiles from
 - `max_concurrent`: Maximum number of concurrent profile fetches
 - `cache_expiration_days`: Number of days to cache profile pictures for
+- `max_cache_size_mb`: Maximum size of the cache in megabytes (LRU cache will remove least recently used files when this limit is exceeded)
+- `lru_check_interval`: Interval in minutes to check and clean the LRU cache
 
 ## Running
 
@@ -187,6 +192,22 @@ This will build and start the relay on http://localhost:8080.
 ## Example Client
 
 See `profile-pic-example.html` for an example of how to use the profile picture endpoint in a web page.
+
+## LRU Cache Management
+
+The relay implements a Least Recently Used (LRU) cache mechanism to automatically manage the cache size:
+
+- The cache size is limited by the `max_cache_size_mb` configuration parameter
+- The system tracks when each file was last accessed
+- When the cache size exceeds the limit, the least recently used files are removed first
+- The cache is checked periodically based on the `lru_check_interval` configuration parameter
+
+This ensures that:
+1. The cache doesn't grow indefinitely
+2. The most frequently accessed profile pictures remain in the cache
+3. Older, unused profile pictures are automatically removed
+
+You can still manually purge the cache using the purge endpoints if needed.
 
 ## Use Cases
 

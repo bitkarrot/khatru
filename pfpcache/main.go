@@ -31,26 +31,30 @@ type ProfileMetadata struct {
 	DisplayName string `json:"display_name,omitempty"`
 }
 
-// Config holds the application configuration
+// Config holds the configuration for the relay
 type Config struct {
-	ListenAddr        string   `json:"listen_addr"`
-	DatabasePath      string   `json:"database_path"`
-	MediaCachePath    string   `json:"media_cache_path"`
-	UpstreamRelays    []string `json:"upstream_relays"`
-	MaxConcurrent     int      `json:"max_concurrent"`
-	CacheExpirationDays int    `json:"cache_expiration_days"`
+	ListenAddr         string   `json:"listen_addr"`
+	DatabasePath       string   `json:"database_path"`
+	MediaCachePath     string   `json:"media_cache_path"`
+	UpstreamRelays     []string `json:"upstream_relays"`
+	MaxConcurrent      int      `json:"max_concurrent"`
+	CacheExpirationDays int      `json:"cache_expiration_days"`
+	MaxCacheSize       int64    `json:"max_cache_size_mb"` // Maximum cache size in MB
+	LRUCheckInterval   int      `json:"lru_check_interval"` // Interval in minutes to check LRU cache
 }
 
 // LoadConfig loads the configuration from a file
 func LoadConfig(configPath string) (*Config, error) {
 	// Default configuration
 	config := &Config{
-		ListenAddr:        ":8080",
-		DatabasePath:      "./data/pfpcache.db",
-		MediaCachePath:    "./data/media_cache",
-		UpstreamRelays:    []string{"wss://damus.io", "wss://primal.net", "wss://nos.lol", "wss://purplepag.es"},
-		MaxConcurrent:     20,
+		ListenAddr:         ":8080",
+		DatabasePath:       "./data/pfpcache.db",
+		MediaCachePath:     "./data/media_cache",
+		UpstreamRelays:     []string{"wss://damus.io", "wss://primal.net", "wss://nos.lol", "wss://purplepag.es"},
+		MaxConcurrent:      20,
 		CacheExpirationDays: 7,
+		MaxCacheSize:       1024, // Default to 1GB
+		LRUCheckInterval:   60,   // Default to 1 hour
 	}
 
 	// Check if config file exists
@@ -82,25 +86,164 @@ func LoadConfig(configPath string) (*Config, error) {
 // FilesystemStorage is a simple filesystem-based storage implementation
 type FilesystemStorage struct {
 	BaseDir string
+	// LRU cache management
+	accessTimes     map[string]time.Time
+	accessTimesMutex sync.RWMutex
+	maxCacheSize    int64 // in bytes
+	checkInterval   time.Duration
 }
 
 // NewFilesystemStorage creates a new filesystem storage
-func NewFilesystemStorage(basePath string) *FilesystemStorage {
-	return &FilesystemStorage{
-		BaseDir: basePath,
+func NewFilesystemStorage(basePath string, maxCacheSizeMB int64, checkIntervalMinutes int) *FilesystemStorage {
+	fs := &FilesystemStorage{
+		BaseDir:       basePath,
+		accessTimes:   make(map[string]time.Time),
+		maxCacheSize:  maxCacheSizeMB * 1024 * 1024, // Convert MB to bytes
+		checkInterval: time.Duration(checkIntervalMinutes) * time.Minute,
 	}
+	
+	// Start the LRU cleaner in a background goroutine
+	go fs.startLRUCleaner()
+	
+	return fs
+}
+
+// startLRUCleaner starts a ticker to periodically check and clean the LRU cache
+func (fs *FilesystemStorage) startLRUCleaner() {
+	ticker := time.NewTicker(fs.checkInterval)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		fs.cleanLRUCache()
+	}
+}
+
+// cleanLRUCache checks the current cache size and removes least recently used files if needed
+func (fs *FilesystemStorage) cleanLRUCache() {
+	log.Printf("Running LRU cache cleanup check")
+	
+	// Get current cache size
+	currentSize, err := fs.getCacheSize()
+	if err != nil {
+		log.Printf("Error getting cache size: %v", err)
+		return
+	}
+	
+	// If we're under the limit, nothing to do
+	if currentSize <= fs.maxCacheSize {
+		log.Printf("Cache size (%.2f MB) is under limit (%.2f MB), no cleanup needed", 
+			float64(currentSize)/(1024*1024), float64(fs.maxCacheSize)/(1024*1024))
+		return
+	}
+	
+	// We need to clean up
+	log.Printf("Cache size (%.2f MB) exceeds limit (%.2f MB), cleaning up", 
+		float64(currentSize)/(1024*1024), float64(fs.maxCacheSize)/(1024*1024))
+	
+	// Get all files with their access times
+	type fileInfo struct {
+		path      string
+		accessTime time.Time
+		size      int64
+	}
+	
+	var files []fileInfo
+	
+	// Lock the map while we read from it
+	fs.accessTimesMutex.RLock()
+	for path, accessTime := range fs.accessTimes {
+		fullPath := filepath.Join(fs.BaseDir, path)
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			// File might have been deleted, remove from access times
+			delete(fs.accessTimes, path)
+			continue
+		}
+		files = append(files, fileInfo{
+			path:       path,
+			accessTime: accessTime,
+			size:       info.Size(),
+		})
+	}
+	fs.accessTimesMutex.RUnlock()
+	
+	// Sort files by access time (oldest first)
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].accessTime.Before(files[j].accessTime)
+	})
+	
+	// Remove files until we're under the limit
+	bytesToRemove := currentSize - fs.maxCacheSize
+	bytesRemoved := int64(0)
+	
+	for _, file := range files {
+		if bytesRemoved >= bytesToRemove {
+			break
+		}
+		
+		fullPath := filepath.Join(fs.BaseDir, file.path)
+		log.Printf("LRU cache: removing %s (last accessed: %s, size: %.2f KB)", 
+			file.path, file.accessTime.Format(time.RFC3339), float64(file.size)/1024)
+		
+		err := os.Remove(fullPath)
+		if err != nil {
+			log.Printf("Error removing file %s: %v", fullPath, err)
+			continue
+		}
+		
+		// Update the removed bytes count
+		bytesRemoved += file.size
+		
+		// Remove from access times
+		fs.accessTimesMutex.Lock()
+		delete(fs.accessTimes, file.path)
+		fs.accessTimesMutex.Unlock()
+	}
+	
+	log.Printf("LRU cache cleanup complete: removed %.2f MB", float64(bytesRemoved)/(1024*1024))
+}
+
+// getCacheSize calculates the total size of all files in the cache
+func (fs *FilesystemStorage) getCacheSize() (int64, error) {
+	var totalSize int64
+	
+	err := filepath.Walk(fs.BaseDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+		}
+		return nil
+	})
+	
+	return totalSize, err
+}
+
+// recordAccess records the access time for a file
+func (fs *FilesystemStorage) recordAccess(key string) {
+	fs.accessTimesMutex.Lock()
+	defer fs.accessTimesMutex.Unlock()
+	fs.accessTimes[key] = time.Now()
 }
 
 // Has checks if a key exists in the storage
 func (fs *FilesystemStorage) Has(key string) bool {
 	path := filepath.Join(fs.BaseDir, key)
 	_, err := os.Stat(path)
-	return err == nil
+	if err == nil {
+		// Record access time
+		fs.recordAccess(key)
+		return true
+	}
+	return false
 }
 
 // Get retrieves a value from the storage
 func (fs *FilesystemStorage) Get(key string) (io.ReadCloser, error) {
 	path := filepath.Join(fs.BaseDir, key)
+	// Record access time
+	fs.recordAccess(key)
 	return os.Open(path)
 }
 
@@ -123,12 +266,22 @@ func (fs *FilesystemStorage) Store(key string, reader io.Reader) error {
 	
 	// Copy the data
 	_, err = io.Copy(file, reader)
+	if err == nil {
+		// Record access time
+		fs.recordAccess(key)
+	}
 	return err
 }
 
 // Delete removes a key from storage
 func (fs *FilesystemStorage) Delete(key string) error {
 	path := filepath.Join(fs.BaseDir, key)
+	
+	// Remove from access times
+	fs.accessTimesMutex.Lock()
+	delete(fs.accessTimes, key)
+	fs.accessTimesMutex.Unlock()
+	
 	return os.Remove(path)
 }
 
@@ -148,6 +301,16 @@ func (fs *FilesystemStorage) PurgeDirectory(dirPath string) error {
 	if err != nil {
 		return err
 	}
+	
+	// Remove all entries with this prefix from access times
+	fs.accessTimesMutex.Lock()
+	prefix := dirPath + "/"
+	for key := range fs.accessTimes {
+		if strings.HasPrefix(key, prefix) || key == dirPath {
+			delete(fs.accessTimes, key)
+		}
+	}
+	fs.accessTimesMutex.Unlock()
 	
 	// Recreate the empty directory
 	return os.MkdirAll(fullPath, 0755)
@@ -258,7 +421,7 @@ func main() {
 	relay.ReplaceEvent = append(relay.ReplaceEvent, db.ReplaceEvent)
 
 	// Initialize filesystem storage for media
-	storage := NewFilesystemStorage(config.MediaCachePath)
+	storage := NewFilesystemStorage(config.MediaCachePath, config.MaxCacheSize, config.LRUCheckInterval)
 	mediaHandler := NewMediaHandler(storage, config)
 
 	// Create a mux for our HTTP handlers
