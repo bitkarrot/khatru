@@ -4,13 +4,14 @@ A Nostr relay that caches profile pictures for fast access. It stores metadata e
 
 ## Features
 
-- Caches profile pictures from metadata events
-- Serves profile pictures via HTTP
-- Configurable upstream relays for fetching profiles
-- Batch caching of profile pictures
-- Cache follows of a user (contact list)
-- Cache purging endpoints
-- LRU (Least Recently Used) cache management
+- Caches profile pictures from Nostr profiles
+- Provides a simple HTTP API to fetch cached profile pictures
+- Automatically fetches profile pictures from multiple relays
+- Supports batch caching of profile pictures
+- Follows caching to pre-cache profile pictures of users that a given user follows
+- Media cache with configurable expiration
+- LRU (Least Recently Used) cache management to automatically remove old files when cache size limit is reached
+- Image resizing to optimize storage and bandwidth usage
 
 ## Usage
 
@@ -152,7 +153,7 @@ curl -X POST http://localhost:8080/purge-profile-pic/32e1827635450ebb3c5a7d12c1f
 
 ## Configuration
 
-The relay can be configured via the `config.json` file:
+The relay can be configured using a JSON configuration file. The default configuration file is `config.json` in the current directory.
 
 ```json
 {
@@ -168,18 +169,26 @@ The relay can be configured via the `config.json` file:
   "max_concurrent": 20,
   "cache_expiration_days": 30,
   "max_cache_size_mb": 1024,
-  "lru_check_interval": 60
+  "lru_check_interval": 60,
+  "resize_images": true,
+  "max_image_size": 200,
+  "image_quality": 85
 }
 ```
 
-- `listen_addr`: The address to listen on
-- `database_path`: Path to the SQLite database file
-- `media_cache_path`: Path to the directory where media files are cached
-- `upstream_relays`: List of Nostr relays to fetch profiles from
-- `max_concurrent`: Maximum number of concurrent profile fetches
-- `cache_expiration_days`: Number of days to cache profile pictures for
-- `max_cache_size_mb`: Maximum size of the cache in megabytes (LRU cache will remove least recently used files when this limit is exceeded)
-- `lru_check_interval`: Interval in minutes to check and clean the LRU cache
+| Parameter | Description |
+| --- | --- |
+| `listen_addr` | The address to listen on |
+| `database_path` | The path to the SQLite database |
+| `media_cache_path` | The path to the media cache directory |
+| `upstream_relays` | A list of upstream relays to fetch profiles from |
+| `max_concurrent` | The maximum number of concurrent requests to upstream relays |
+| `cache_expiration_days` | The number of days after which cached media expires (default: 30 days) |
+| `max_cache_size_mb` | The maximum size of the cache in megabytes (default: 1024 MB) |
+| `lru_check_interval` | The interval in minutes to check and clean the LRU cache (default: 60 minutes) |
+| `resize_images` | Whether to resize profile images to optimize storage and bandwidth (default: true) |
+| `max_image_size` | The maximum width/height for resized profile images in pixels (default: 200) |
+| `image_quality` | The JPEG quality for resized images (1-100, default: 85) |
 
 ## Running
 

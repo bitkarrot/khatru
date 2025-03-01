@@ -5,8 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/disintegration/imaging"
 	"github.com/fiatjaf/eventstore/sqlite3"
 	"github.com/fiatjaf/khatru"
 	"github.com/nbd-wtf/go-nostr"
@@ -42,6 +48,9 @@ type Config struct {
 	CacheExpirationDays int      `json:"cache_expiration_days"`
 	MaxCacheSize       int64    `json:"max_cache_size_mb"` // Maximum cache size in MB
 	LRUCheckInterval   int      `json:"lru_check_interval"` // Interval in minutes to check LRU cache
+	ResizeImages       bool     `json:"resize_images"` // Whether to resize profile images
+	MaxImageSize       int      `json:"max_image_size"` // Maximum width/height for profile images
+	ImageQuality       int      `json:"image_quality"` // JPEG quality (1-100)
 }
 
 // LoadConfig loads the configuration from a file
@@ -56,6 +65,9 @@ func LoadConfig(configPath string) (*Config, error) {
 		CacheExpirationDays: 30,
 		MaxCacheSize:       1024, // Default to 1GB
 		LRUCheckInterval:   60,   // Default to 1 hour
+		ResizeImages:       true,  // Default to resizing images
+		MaxImageSize:       200,   // Default to 200x200
+		ImageQuality:       85,    // Default to 85% JPEG quality
 	}
 
 	// Check if config file exists
@@ -86,7 +98,7 @@ func LoadConfig(configPath string) (*Config, error) {
 
 // FilesystemStorage is a simple filesystem-based storage implementation
 type FilesystemStorage struct {
-	BaseDir string
+	baseDir string
 	// LRU cache management
 	accessTimes     map[string]time.Time
 	accessTimesMutex sync.RWMutex
@@ -97,7 +109,7 @@ type FilesystemStorage struct {
 // NewFilesystemStorage creates a new filesystem storage
 func NewFilesystemStorage(basePath string, maxCacheSizeMB int64, checkIntervalMinutes int) *FilesystemStorage {
 	fs := &FilesystemStorage{
-		BaseDir:       basePath,
+		baseDir:       basePath,
 		accessTimes:   make(map[string]time.Time),
 		maxCacheSize:  maxCacheSizeMB * 1024 * 1024, // Convert MB to bytes
 		checkInterval: time.Duration(checkIntervalMinutes) * time.Minute,
@@ -153,7 +165,7 @@ func (fs *FilesystemStorage) cleanLRUCache() {
 	// Lock the map while we read from it
 	fs.accessTimesMutex.RLock()
 	for path, accessTime := range fs.accessTimes {
-		fullPath := filepath.Join(fs.BaseDir, path)
+		fullPath := filepath.Join(fs.baseDir, path)
 		info, err := os.Stat(fullPath)
 		if err != nil {
 			// File might have been deleted, remove from access times
@@ -182,7 +194,7 @@ func (fs *FilesystemStorage) cleanLRUCache() {
 			break
 		}
 		
-		fullPath := filepath.Join(fs.BaseDir, file.path)
+		fullPath := filepath.Join(fs.baseDir, file.path)
 		log.Printf("LRU cache: removing %s (last accessed: %s, size: %.2f KB)", 
 			file.path, file.accessTime.Format(time.RFC3339), float64(file.size)/1024)
 		
@@ -208,7 +220,7 @@ func (fs *FilesystemStorage) cleanLRUCache() {
 func (fs *FilesystemStorage) getCacheSize() (int64, error) {
 	var totalSize int64
 	
-	err := filepath.Walk(fs.BaseDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(fs.baseDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -230,7 +242,7 @@ func (fs *FilesystemStorage) recordAccess(key string) {
 
 // Has checks if a key exists in the storage
 func (fs *FilesystemStorage) Has(key string) bool {
-	path := filepath.Join(fs.BaseDir, key)
+	path := filepath.Join(fs.baseDir, key)
 	_, err := os.Stat(path)
 	if err == nil {
 		// Record access time
@@ -241,16 +253,40 @@ func (fs *FilesystemStorage) Has(key string) bool {
 }
 
 // Get retrieves a value from the storage
-func (fs *FilesystemStorage) Get(key string) (io.ReadCloser, error) {
-	path := filepath.Join(fs.BaseDir, key)
+func (fs *FilesystemStorage) Get(key string) ([]byte, error) {
+	path := filepath.Join(fs.baseDir, key)
+	
+	// Read the file
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	
 	// Record access time
 	fs.recordAccess(key)
-	return os.Open(path)
+	
+	return data, nil
+}
+
+// GetReader retrieves a value from the storage as an io.ReadCloser
+func (fs *FilesystemStorage) GetReader(key string) (io.ReadCloser, error) {
+	path := filepath.Join(fs.baseDir, key)
+	
+	// Open the file
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Record access time
+	fs.recordAccess(key)
+	
+	return file, nil
 }
 
 // Store stores a value in the storage
-func (fs *FilesystemStorage) Store(key string, reader io.Reader) error {
-	path := filepath.Join(fs.BaseDir, key)
+func (fs *FilesystemStorage) Store(key string, data interface{}) error {
+	path := filepath.Join(fs.baseDir, key)
 	
 	// Ensure the directory exists
 	dir := filepath.Dir(path)
@@ -265,18 +301,30 @@ func (fs *FilesystemStorage) Store(key string, reader io.Reader) error {
 	}
 	defer file.Close()
 	
-	// Copy the data
-	_, err = io.Copy(file, reader)
-	if err == nil {
-		// Record access time
-		fs.recordAccess(key)
+	// Write the data to the file
+	var writeErr error
+	switch d := data.(type) {
+	case []byte:
+		_, writeErr = file.Write(d)
+	case io.Reader:
+		_, writeErr = io.Copy(file, d)
+	default:
+		return fmt.Errorf("unsupported data type: %T", data)
 	}
-	return err
+	
+	if writeErr != nil {
+		return writeErr
+	}
+	
+	// Record access time
+	fs.recordAccess(key)
+	
+	return nil
 }
 
 // Delete removes a key from storage
 func (fs *FilesystemStorage) Delete(key string) error {
-	path := filepath.Join(fs.BaseDir, key)
+	path := filepath.Join(fs.baseDir, key)
 	
 	// Remove from access times
 	fs.accessTimesMutex.Lock()
@@ -288,7 +336,7 @@ func (fs *FilesystemStorage) Delete(key string) error {
 
 // PurgeDirectory removes all files in a directory
 func (fs *FilesystemStorage) PurgeDirectory(dirPath string) error {
-	fullPath := filepath.Join(fs.BaseDir, dirPath)
+	fullPath := filepath.Join(fs.baseDir, dirPath)
 	
 	// Check if directory exists
 	_, err := os.Stat(fullPath)
@@ -317,6 +365,51 @@ func (fs *FilesystemStorage) PurgeDirectory(dirPath string) error {
 	return os.MkdirAll(fullPath, 0755)
 }
 
+// List returns a list of keys in the storage
+func (fs *FilesystemStorage) List(pattern string) ([]string, error) {
+	var keys []string
+	
+	// If pattern contains wildcards, use filepath.Glob
+	if strings.Contains(pattern, "*") || strings.Contains(pattern, "?") || strings.Contains(pattern, "[") {
+		// Get the directory part of the pattern
+		dir := filepath.Dir(pattern)
+		if dir == "." {
+			dir = fs.baseDir
+		} else {
+			dir = filepath.Join(fs.baseDir, dir)
+		}
+		
+		// Get the base part of the pattern
+		base := filepath.Base(pattern)
+		
+		// Create the full pattern
+		fullPattern := filepath.Join(dir, base)
+		
+		// Use filepath.Glob to find matching files
+		matches, err := filepath.Glob(fullPattern)
+		if err != nil {
+			return nil, err
+		}
+		
+		// Convert full paths to keys
+		for _, match := range matches {
+			// Remove the base directory prefix to get the key
+			key := strings.TrimPrefix(match, fs.baseDir+"/")
+			keys = append(keys, key)
+		}
+		
+		return keys, nil
+	}
+	
+	// If no wildcards, just check if the file exists
+	path := filepath.Join(fs.baseDir, pattern)
+	if _, err := os.Stat(path); err == nil {
+		keys = append(keys, pattern)
+	}
+	
+	return keys, nil
+}
+
 // MediaHandler handles HTTP requests for media files
 type MediaHandler struct {
 	storage *FilesystemStorage
@@ -338,11 +431,8 @@ func (h *MediaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	key := r.URL.Path
-	if key == "" {
-		http.Error(w, "Missing key", http.StatusBadRequest)
-		return
-	}
+	// Extract the key from the URL
+	key := strings.TrimPrefix(r.URL.Path, "/media/")
 	
 	// Check if the file exists
 	if !h.storage.Has(key) {
@@ -351,31 +441,27 @@ func (h *MediaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Get the file
-	reader, err := h.storage.Get(key)
+	data, err := h.storage.Get(key)
 	if err != nil {
 		http.Error(w, "Error retrieving file", http.StatusInternalServerError)
 		return
 	}
-	defer reader.Close()
 	
 	// Determine content type based on file extension
 	ext := filepath.Ext(key)
-	contentType := "application/octet-stream" // Default
-	if ext == ".jpg" || ext == ".jpeg" {
-		contentType = "image/jpeg"
-	} else if ext == ".png" {
-		contentType = "image/png"
-	} else if ext == ".gif" {
-		contentType = "image/gif"
-	} else if ext == ".webp" {
-		contentType = "image/webp"
+	contentType := mime.TypeByExtension(ext)
+	if contentType == "" {
+		// Default to octet-stream if we can't determine the content type
+		contentType = "application/octet-stream"
 	}
 	
+	// Set content type
 	w.Header().Set("Content-Type", contentType)
+	
 	// Cache for the number of days specified in config
 	cacheSeconds := h.config.CacheExpirationDays * 24 * 60 * 60
 	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", cacheSeconds))
-	io.Copy(w, reader)
+	w.Write(data)
 }
 
 // BatchCacheRequest represents a request to cache multiple profile pictures
@@ -499,7 +585,7 @@ func main() {
 				if storage.Has(cacheKey) {
 					log.Printf("Found cached profile picture for %s with extension %s", pubkey, ext)
 					var err error
-					reader, err = storage.Get(cacheKey)
+					reader, err = storage.GetReader(cacheKey)
 					if err != nil {
 						continue
 					}
@@ -609,7 +695,7 @@ func main() {
 			if storage.Has(cacheKey) {
 				log.Printf("Found cached profile picture for %s with extension %s", pubkey, ext)
 				var err error
-				reader, err = storage.Get(cacheKey)
+				reader, err = storage.GetReader(cacheKey)
 				if err != nil {
 					continue
 				}
@@ -723,7 +809,7 @@ func main() {
 		// Start a goroutine to fetch follows and cache their profile pictures
 		go func() {
 			// Get the user's follows
-			follows, err := fetchFollows(pubkey, limit)
+			follows, err := fetchFollows(pubkey, limit, config, storage)
 			if err != nil {
 				log.Printf("Error fetching follows for %s: %v", pubkey, err)
 				return
@@ -764,17 +850,55 @@ func main() {
 		}
 		
 		// Limit the number of pubkeys to process
-		if len(request.Pubkeys) > 1000 {
-			request.Pubkeys = request.Pubkeys[:1000]
+		maxPubkeys := 1000
+		if len(request.Pubkeys) > maxPubkeys {
+			request.Pubkeys = request.Pubkeys[:maxPubkeys]
 		}
 		
+		// Get limit parameter (default to 50)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 50
+		if limitStr != "" {
+			if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+				limit = l
+				if limit > 1000 {
+					limit = 1000 // Cap at 1000 to prevent abuse
+				}
+			}
+		}
+		
+		// If we have a single pubkey and a limit, try to fetch follows
+		if len(request.Pubkeys) == 1 && limit > 0 {
+			pubkey := request.Pubkeys[0]
+			go func() {
+				follows, err := fetchFollows(pubkey, limit, config, storage)
+				if err != nil {
+					log.Printf("Error fetching follows for %s: %v", pubkey, err)
+					return
+				}
+				log.Printf("Successfully fetched %d follows for %s", len(follows), pubkey)
+			}()
+			
+			response := BatchCacheResponse{
+				Status:  "accepted",
+				Message: fmt.Sprintf("Fetching and caching up to %d profile pictures for follows of %s", limit, pubkey),
+				Count:   limit,
+			}
+			
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		
+		// Otherwise, just cache the provided pubkeys
 		go func() {
 			fetchAndCacheProfiles(relay, storage, request.Pubkeys, *config)
 		}()
 		
 		response := BatchCacheResponse{
+			Status:  "accepted",
 			Message: fmt.Sprintf("Started caching %d profile pictures", len(request.Pubkeys)),
-			Count: len(request.Pubkeys),
+			Count:   len(request.Pubkeys),
 		}
 		
 		w.Header().Set("Content-Type", "application/json")
@@ -906,7 +1030,7 @@ func main() {
 		}
 
 		// Cache the image in the background
-		go cacheProfileImage(storage, event.PubKey, metadata.Picture)
+		go cacheProfileImage(storage, event.PubKey, metadata.Picture, config)
 	})
 
 	// Combine our handlers with the relay's handlers
@@ -928,86 +1052,266 @@ func main() {
 	log.Fatal(http.ListenAndServe(config.ListenAddr, nil))
 }
 
+func (h *MediaHandler) CacheProfilePicture(w http.ResponseWriter, r *http.Request) {
+	pubkey := r.URL.Query().Get("pubkey")
+	if pubkey == "" {
+		http.Error(w, "Missing pubkey parameter", http.StatusBadRequest)
+		return
+	}
+	
+	// Check if we have this profile in our database
+	relay, err := getRelayInstance()
+	if err != nil {
+		http.Error(w, "Error getting relay instance", http.StatusInternalServerError)
+		return
+	}
+	
+	// Query for the profile metadata
+	filter := nostr.Filter{Kinds: []int{0}, Authors: []string{pubkey}}
+	events, err := queryEvents(relay, filter)
+	if err != nil || len(events) == 0 {
+		// Not found in our database, try public relays
+		metadata, err := fetchProfileFromPublicRelays(pubkey)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error fetching profile: %v", err), http.StatusInternalServerError)
+			return
+		}
+		
+		// Cache the profile picture
+		err = cacheProfileImage(h.storage, pubkey, metadata.Picture, h.config)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error caching profile picture: %v", err), http.StatusInternalServerError)
+			return
+		}
+		
+		// Resize the image if needed
+		if h.config.ResizeImages {
+			err = resizeProfileImage(h.storage, pubkey, h.config)
+			if err != nil {
+				log.Printf("Error resizing profile picture: %v", err)
+			}
+		}
+		
+		// Try with different possible extensions
+		extensions := []string{".jpg", ".png", ".gif", ".webp"}
+		
+		for _, ext := range extensions {
+			cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+			if h.storage.Has(cacheKey) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"success":true,"path":"/media/` + cacheKey + `"}`))
+				return
+			}
+		}
+		
+		http.Error(w, "Failed to cache profile picture", http.StatusInternalServerError)
+		return
+	}
+	
+	// Parse the profile metadata
+	var metadata ProfileMetadata
+	if err := json.Unmarshal([]byte(events[0].Content), &metadata); err != nil {
+		http.Error(w, fmt.Sprintf("Error parsing profile: %v", err), http.StatusInternalServerError)
+		return
+	}
+	
+	// Check if the profile has a picture URL
+	if metadata.Picture == "" {
+		http.Error(w, "Profile has no picture URL", http.StatusNotFound)
+		return
+	}
+	
+	// Cache the profile picture
+	err = cacheProfileImage(h.storage, pubkey, metadata.Picture, h.config)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error caching profile picture: %v", err), http.StatusInternalServerError)
+		return
+	}
+	
+	// Resize the image if needed
+	if h.config.ResizeImages {
+		err = resizeProfileImage(h.storage, pubkey, h.config)
+		if err != nil {
+			log.Printf("Error resizing profile picture: %v", err)
+		}
+	}
+	
+	// Try with different possible extensions
+	extensions := []string{".jpg", ".png", ".gif", ".webp"}
+	
+	for _, ext := range extensions {
+		cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+		if h.storage.Has(cacheKey) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"path":"/media/` + cacheKey + `"}`))
+			return
+		}
+	}
+	
+	http.Error(w, "Failed to cache profile picture", http.StatusInternalServerError)
+}
+
+func (h *MediaHandler) PurgeProfilePicture(w http.ResponseWriter, r *http.Request) {
+	pubkey := r.URL.Query().Get("pubkey")
+	if pubkey == "" {
+		http.Error(w, "Missing pubkey parameter", http.StatusBadRequest)
+		return
+	}
+	
+	// Try with different possible extensions
+	extensions := []string{".jpg", ".png", ".gif", ".webp"}
+	var deleted bool
+	
+	for _, ext := range extensions {
+		cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+		if h.storage.Has(cacheKey) {
+			err := h.storage.Delete(cacheKey)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error deleting profile picture: %v", err), http.StatusInternalServerError)
+				return
+			}
+			deleted = true
+		}
+	}
+	
+	if deleted {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true}`))
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":false,"error":"Profile picture not found"}`))
+	}
+}
+
 // cacheProfileImage caches a profile image
-func cacheProfileImage(storage *FilesystemStorage, pubkey, pictureURL string) error {
+func cacheProfileImage(storage *FilesystemStorage, pubkey, pictureURL string, config *Config) error {
 	log.Printf("Caching profile picture for %s: %s", pubkey, pictureURL)
 	
 	// Extract file extension from the URL
 	ext := filepath.Ext(pictureURL)
 	if ext == "" {
-		// Try to extract extension from the last path component if no extension in the URL
+		// Try to get extension from the last part of the URL path
 		parts := strings.Split(pictureURL, "/")
 		if len(parts) > 0 {
 			lastPart := parts[len(parts)-1]
 			if strings.Contains(lastPart, ".") {
-				ext = filepath.Ext(lastPart)
+				ext = "." + strings.Split(lastPart, ".")[1]
 			}
 		}
 	}
 	
-	// If we still don't have an extension, try to infer from common image hosts
-	if ext == "" {
-		if strings.Contains(pictureURL, "nostr.build") {
-			// Try to extract extension from nostr.build URLs which often have format indicators
-			if strings.Contains(pictureURL, ".jpg") || strings.Contains(pictureURL, ".jpeg") {
-				ext = ".jpg"
-			} else if strings.Contains(pictureURL, ".png") {
-				ext = ".png"
-			} else if strings.Contains(pictureURL, ".gif") {
-				ext = ".gif"
-			} else if strings.Contains(pictureURL, ".webp") {
-				ext = ".webp"
-			}
-		}
-	}
-	
-	// Default to .jpg if we couldn't determine the extension
-	if ext == "" {
-		ext = ".jpg"
-	}
-	
-	// Create the cache key with extension
-	cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
-	
-	// Check if we already have this image cached
-	if storage.Has(cacheKey) {
-		log.Printf("Profile picture for %s already cached", pubkey)
-		return nil
+	// Create a client with a timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
 	}
 	
 	// Fetch the image
-	resp, err := http.Get(pictureURL)
+	resp, err := client.Get(pictureURL)
 	if err != nil {
-		return fmt.Errorf("error fetching image: %v", err)
+		return fmt.Errorf("error fetching profile picture: %w", err)
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("error fetching image, status: %d", resp.StatusCode)
+		return fmt.Errorf("error fetching profile picture: status code %d", resp.StatusCode)
 	}
 	
-	// Check content type from response and adjust extension if needed
-	contentType := resp.Header.Get("Content-Type")
-	if contentType != "" && ext == ".jpg" {
-		// Only override the default extension if we're using the default
-		if contentType == "image/png" {
-			ext = ".png"
-			cacheKey = fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
-		} else if contentType == "image/gif" {
-			ext = ".gif"
-			cacheKey = fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
-		} else if contentType == "image/webp" {
-			ext = ".webp"
-			cacheKey = fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+	// If we still don't have an extension, try to get it from the Content-Type header
+	if ext == "" {
+		contentType := resp.Header.Get("Content-Type")
+		extensions, _ := mime.ExtensionsByType(contentType)
+		if len(extensions) > 0 {
+			ext = extensions[0]
+		} else {
+			// Default to .jpg if we can't determine the extension
+			ext = ".jpg"
 		}
 	}
+
+	// Normalize extensions
+	ext = strings.ToLower(ext)
+	if ext == ".jpe" || ext == ".jfif" || ext == ".jpeg" {
+		ext = ".jpg"
+	}
 	
-	// Store the image
-	if err := storage.Store(cacheKey, resp.Body); err != nil {
-		return fmt.Errorf("error storing image: %v", err)
+	// Ensure the extension starts with a dot
+	if !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
+	}
+
+	// Create the key for storage
+	key := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+	
+	// Save the original image first
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading image data: %w", err)
+	}
+	
+	// Store the original image
+	if err := storage.Store(key, imageData); err != nil {
+		return fmt.Errorf("error storing profile picture: %w", err)
 	}
 	
 	log.Printf("Successfully cached profile picture for %s with extension %s", pubkey, ext)
+	return nil
+}
+
+// Resize a previously cached image
+func resizeProfileImage(storage *FilesystemStorage, pubkey string, config *Config) error {
+	// Find the image in storage
+	files, err := storage.List("profile-pic/" + pubkey + ".*")
+	if err != nil || len(files) == 0 {
+		return fmt.Errorf("no profile picture found for %s", pubkey)
+	}
+	
+	// Get the first matching file
+	key := files[0]
+	
+	// Log the file extension for debugging
+	log.Printf("Resizing image with extension: %s", filepath.Ext(key))
+	
+	// Get the image data
+	data, err := storage.Get(key)
+	if err != nil {
+		return fmt.Errorf("error reading profile picture: %w", err)
+	}
+	
+	// Decode the image
+	img, format, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("error decoding profile picture: %w", err)
+	}
+	
+	// Resize the image
+	resized := imaging.Resize(img, config.MaxImageSize, 0, imaging.Lanczos)
+	
+	// Create a buffer to store the resized image
+	buf := new(bytes.Buffer)
+	
+	// Encode the resized image
+	switch format {
+	case "jpeg":
+		err = jpeg.Encode(buf, resized, &jpeg.Options{Quality: config.ImageQuality})
+	case "png":
+		err = png.Encode(buf, resized)
+	case "gif":
+		err = gif.Encode(buf, resized, nil)
+	default:
+		// Default to JPEG
+		err = jpeg.Encode(buf, resized, &jpeg.Options{Quality: config.ImageQuality})
+	}
+	
+	if err != nil {
+		return fmt.Errorf("error encoding resized profile picture: %w", err)
+	}
+	
+	// Store the resized image
+	if err := storage.Store(key, buf.Bytes()); err != nil {
+		return fmt.Errorf("error storing resized profile picture: %w", err)
+	}
+	
+	log.Printf("Successfully resized profile picture for %s", pubkey)
 	return nil
 }
 
@@ -1083,7 +1387,7 @@ func fetchAndCacheProfiles(relay *khatru.Relay, storage *FilesystemStorage, pubk
 			}
 			
 			// Cache the image
-			if err := cacheProfileImage(storage, pk, metadata.Picture); err != nil {
+			if err := cacheProfileImage(storage, pk, metadata.Picture, &config); err != nil {
 				mu.Lock()
 				failCount++
 				mu.Unlock()
@@ -1253,33 +1557,128 @@ func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
 	return &metadata, nil
 }
 
-// fetchFollows fetches the follows for a given pubkey
-func fetchFollows(pubkey string, limit int) ([]string, error) {
-	// Get the configuration
-	config, err := LoadConfig("./config.json")
-	if err != nil {
-		log.Printf("Error loading config, using default relays: %v", err)
-		// Use default relays if config can't be loaded
-		config = &Config{
-			UpstreamRelays: []string{"wss://damus.io", "wss://primal.net", "wss://nos.lol", "wss://purplepag.es"},
-		}
-	}
-
-	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
+// fetchFollows fetches a user's follows from public relays and caches their profile pictures
+func fetchFollows(pubkey string, limit int, config *Config, storage *FilesystemStorage) ([]string, error) {
+	log.Printf("Fetching follows for %s with limit %d", pubkey, limit)
+	
 	// Query for the contact list
-	filter := nostr.Filter{
-		Kinds:   []int{3}, // Kind 3 is contact list
-		Authors: []string{pubkey},
-		Limit:   1,
+	filter := nostr.Filter{Kinds: []int{3}, Authors: []string{pubkey}}
+	
+	// Connect to relays and fetch the contact list
+	var follows []string
+	var foundEvent bool
+	var totalRelaysAttempted int
+	var successfulRelays int
+	
+	for _, url := range config.UpstreamRelays {
+		totalRelaysAttempted++
+		relay, err := nostr.RelayConnect(context.Background(), url)
+		if err != nil {
+			log.Printf("Error connecting to relay %s: %v", url, err)
+			continue
+		}
+		
+		sub, err := relay.Subscribe(context.Background(), []nostr.Filter{filter})
+		if err != nil {
+			log.Printf("Error subscribing to relay %s: %v", url, err)
+			relay.Close()
+			continue
+		}
+		
+		ev := <-sub.Events
+		if ev != nil {
+			foundEvent = true
+			successfulRelays++
+			
+			// Extract contacts from the "p" tags
+			for _, tag := range ev.Tags {
+				if len(tag) >= 2 && tag[0] == "p" {
+					follows = append(follows, tag[1])
+				}
+			}
+			
+			log.Printf("Found %d contacts for %s on relay %s", len(follows), pubkey, url)
+			break
+		} else {
+			log.Printf("No contact list found for %s on relay %s", pubkey, url)
+		}
+		
+		relay.Close()
 	}
+	
+	if !foundEvent {
+		log.Printf("Failed to fetch contact list for %s after trying %d relays (successful: %d)", pubkey, totalRelaysAttempted, successfulRelays)
+		return nil, fmt.Errorf("failed to fetch contact list for %s", pubkey)
+	}
+	
+	// Limit the number of follows to cache
+	if limit > 0 && len(follows) > limit {
+		follows = follows[:limit]
+	}
+	
+	log.Printf("Processing %d follows for %s", len(follows), pubkey)
+	
+	// Step 1: Cache profile pictures for each follow (without resizing)
+	var cached []string
+	var errors int
+	var noPicture int
+	
+	for _, follow := range follows {
+		// Get profile metadata for the follow
+		metadata, err := getProfileMetadata(follow, config)
+		if err != nil {
+			log.Printf("Error getting profile metadata for %s: %v", follow, err)
+			errors++
+			continue
+		}
+		
+		// Check if the profile has a picture URL
+		if metadata.Picture == "" {
+			log.Printf("No profile picture found for %s", follow)
+			noPicture++
+			continue
+		}
+		
+		// Cache the profile picture (without resizing)
+		err = cacheProfileImage(storage, follow, metadata.Picture, config)
+		if err != nil {
+			log.Printf("Error caching profile picture for %s: %v", follow, err)
+			errors++
+			continue
+		}
+		
+		cached = append(cached, follow)
+	}
+	
+	log.Printf("Cached %d/%d profile pictures for follows of %s (errors: %d, no picture: %d)", 
+		len(cached), len(follows), pubkey, errors, noPicture)
+	
+	// Step 2: Resize all cached images
+	if config.ResizeImages {
+		log.Printf("Starting batch resize of %d images", len(cached))
+		var resizeErrors int
+		
+		for _, follow := range cached {
+			err := resizeProfileImage(storage, follow, config)
+			if err != nil {
+				log.Printf("Error resizing profile picture for %s: %v", follow, err)
+				resizeErrors++
+			}
+		}
+		
+		log.Printf("Completed batch resize with %d errors", resizeErrors)
+	}
+	
+	return cached, nil
+}
 
-	log.Printf("Querying public relays for follows of %s", pubkey)
+// getProfileMetadata fetches a profile's metadata
+func getProfileMetadata(pubkey string, config *Config) (*ProfileMetadata, error) {
+	// Query for the profile metadata
+	filter := nostr.Filter{Kinds: []int{0}, Authors: []string{pubkey}}
 	
 	// Try each relay individually to avoid WaitGroup issues
-	var contactEvent *nostr.Event
+	var profileEvent *nostr.Event
 	
 	// Create a channel to receive events
 	eventChan := make(chan *nostr.Event, 1)
@@ -1287,10 +1686,10 @@ func fetchFollows(pubkey string, limit int) ([]string, error) {
 	
 	// Try each relay with a timeout
 	for _, relayURL := range config.UpstreamRelays {
-		log.Printf("Checking relay %s for contact list of %s", relayURL, pubkey)
+		log.Printf("Checking relay %s for profile of %s", relayURL, pubkey)
 		
 		// Create a context with a shorter timeout for each relay
-		relayCtx, relayCancel := context.WithTimeout(ctx, 10*time.Second)
+		relayCtx, relayCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		
 		go func(relayURL string) {
 			// Connect to the relay
@@ -1314,14 +1713,14 @@ func fetchFollows(pubkey string, limit int) ([]string, error) {
 			for {
 				select {
 				case ev := <-sub.Events:
-					if ev != nil && ev.Kind == 3 && ev.PubKey == pubkey {
+					if ev != nil && ev.Kind == 0 && ev.PubKey == pubkey {
 						eventChan <- ev
 						relay.Close()
 						relayCancel()
 						return
 					}
 				case <-sub.EndOfStoredEvents:
-					errChan <- fmt.Errorf("no contact list found on %s", relayURL)
+					errChan <- fmt.Errorf("no profile found on %s", relayURL)
 					relay.Close()
 					relayCancel()
 					return
@@ -1335,45 +1734,36 @@ func fetchFollows(pubkey string, limit int) ([]string, error) {
 		
 		// Wait for either an event or an error
 		select {
-		case contactEvent = <-eventChan:
-			log.Printf("Found contact list for %s on relay %s", pubkey, relayURL)
+		case profileEvent = <-eventChan:
+			log.Printf("Found profile for %s on relay %s", pubkey, relayURL)
 			relayCancel()
 			break
 		case err := <-errChan:
 			log.Printf("Error from relay %s: %v", relayURL, err)
 			relayCancel()
 			continue
-		case <-time.After(10 * time.Second):
+		case <-time.After(5 * time.Second):
 			log.Printf("Timeout waiting for relay %s", relayURL)
 			relayCancel()
 			continue
 		}
 		
-		if contactEvent != nil {
+		if profileEvent != nil {
 			break
 		}
 	}
 	
-	if contactEvent == nil {
-		return nil, fmt.Errorf("contact list not found on any configured relay")
+	if profileEvent == nil {
+		return nil, fmt.Errorf("profile not found on any configured relay")
 	}
 
-	// Extract pubkeys from the contact list
-	var follows []string
-	for _, tag := range contactEvent.Tags {
-		if len(tag) >= 2 && tag[0] == "p" {
-			follows = append(follows, tag[1])
-		}
+	// Parse the profile metadata
+	var metadata ProfileMetadata
+	if err := json.Unmarshal([]byte(profileEvent.Content), &metadata); err != nil {
+		return nil, fmt.Errorf("error parsing profile: %v", err)
 	}
 
-	log.Printf("Fetched %d follows for %s", len(follows), pubkey)
-
-	// Limit the number of follows to process
-	if limit > 0 && len(follows) > limit {
-		follows = follows[:limit]
-	}
-
-	return follows, nil
+	return &metadata, nil
 }
 
 // Global relay instance for access from any function
@@ -1390,4 +1780,51 @@ func getRelayInstance() (*khatru.Relay, error) {
 		return nil, fmt.Errorf("relay instance not set")
 	}
 	return globalRelay, nil
+}
+
+func (h *MediaHandler) HasProfilePicture(w http.ResponseWriter, r *http.Request) {
+	pubkey := r.URL.Query().Get("pubkey")
+	if pubkey == "" {
+		http.Error(w, "Missing pubkey parameter", http.StatusBadRequest)
+		return
+	}
+	
+	// Try with different possible extensions
+	extensions := []string{".jpg", ".png", ".gif", ".webp"}
+	
+	for _, ext := range extensions {
+		cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+		if h.storage.Has(cacheKey) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"has_picture":true,"path":"/media/` + cacheKey + `"}`))
+			return
+		}
+	}
+	
+	// No profile picture found
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"has_picture":false}`))
+}
+
+func (h *MediaHandler) GetProfilePicture(w http.ResponseWriter, r *http.Request) {
+	pubkey := r.URL.Query().Get("pubkey")
+	if pubkey == "" {
+		http.Error(w, "Missing pubkey parameter", http.StatusBadRequest)
+		return
+	}
+	
+	// Try with different possible extensions
+	extensions := []string{".jpg", ".png", ".gif", ".webp"}
+	
+	for _, ext := range extensions {
+		cacheKey := fmt.Sprintf("profile-pic/%s%s", pubkey, ext)
+		if h.storage.Has(cacheKey) {
+			// Redirect to the media endpoint
+			http.Redirect(w, r, "/media/"+cacheKey, http.StatusFound)
+			return
+		}
+	}
+	
+	// No profile picture found
+	http.Error(w, "Profile picture not found", http.StatusNotFound)
 }
