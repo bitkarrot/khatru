@@ -1533,6 +1533,20 @@ func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
 		return nil, fmt.Errorf("profile not found on any configured relay")
 	}
 
+	// Store the profile in our local database
+	relay, err := getRelayInstance()
+	if err == nil {
+		// Create a separate context for database operations to ensure they complete
+		dbCtx := context.Background()
+		for _, storeFunc := range relay.StoreEvent {
+			if err := storeFunc(dbCtx, profileEvent); err != nil {
+				log.Printf("Error storing event: %v", err)
+			} else {
+				log.Printf("Successfully stored profile event in database for %s", pubkey)
+			}
+		}
+	}
+
 	// Parse the profile metadata
 	var metadata ProfileMetadata
 	if err := json.Unmarshal([]byte(profileEvent.Content), &metadata); err != nil {
@@ -1542,16 +1556,6 @@ func fetchProfileFromPublicRelays(pubkey string) (*ProfileMetadata, error) {
 	// Check if the profile has a picture URL
 	if metadata.Picture == "" {
 		return nil, fmt.Errorf("profile has no picture URL")
-	}
-
-	// Store the profile in our local database
-	relay, err := getRelayInstance()
-	if err == nil {
-		for _, storeFunc := range relay.StoreEvent {
-			if err := storeFunc(ctx, profileEvent); err != nil {
-				log.Printf("Error storing event: %v", err)
-			}
-		}
 	}
 
 	return &metadata, nil
@@ -1755,6 +1759,20 @@ func getProfileMetadata(pubkey string, config *Config) (*ProfileMetadata, error)
 	
 	if profileEvent == nil {
 		return nil, fmt.Errorf("profile not found on any configured relay")
+	}
+
+	// Store the profile in our local database
+	relay, err := getRelayInstance()
+	if err == nil {
+		// Create a separate context for database operations to ensure they complete
+		dbCtx := context.Background()
+		for _, storeFunc := range relay.StoreEvent {
+			if err := storeFunc(dbCtx, profileEvent); err != nil {
+				log.Printf("Error storing event: %v", err)
+			} else {
+				log.Printf("Successfully stored profile event in database for %s", pubkey)
+			}
+		}
 	}
 
 	// Parse the profile metadata
