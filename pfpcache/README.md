@@ -13,6 +13,77 @@ A Nostr relay that caches profile pictures for fast access. It stores metadata e
 - LRU (Least Recently Used) cache management to automatically remove old files when cache size limit is reached
 - Image resizing to optimize storage and bandwidth usage
 
+## Installation
+
+### Prerequisites
+
+- [Go](https://golang.org/doc/install) (version 1.18 or later recommended)
+- Git (optional, for cloning the repository)
+
+### Steps
+
+1. Clone or download the repository:
+   ```bash
+   # Using Git
+   git clone https://github.com/bitkarrot/khatru.git
+   cd khatru/pfpcache
+   
+   # Or download and extract the ZIP file for the pfpcache directory only
+   ```
+
+2. Make the run script executable:
+   ```bash
+   chmod +x run.sh
+   ```
+
+3. Run the application:
+   ```bash
+   ./run.sh
+   ```
+
+   This script will:
+   - Create a default configuration file if it doesn't exist
+   - Create necessary data directories
+   - Build the Go code
+   - Start the relay on http://localhost:8080
+
+### Building from Source Manually
+
+If you prefer not to use the run.sh script, you can build and run the application manually:
+
+1. Create the necessary directories:
+   ```bash
+   mkdir -p ./data/media_cache
+   ```
+
+2. Create a config.json file (if it doesn't exist):
+   ```bash
+   cat > ./config.json << EOF
+   {
+     "listen_addr": ":8080",
+     "database_path": "./data/pfpcache.db",
+     "media_cache_path": "./data/media_cache",
+     "upstream_relays": [
+       "wss://damus.io",
+       "wss://primal.net",
+       "wss://nos.lol"
+     ],
+     "max_concurrent": 20,
+     "cache_expiration_days": 7
+   }
+   EOF
+   ```
+
+3. Build the application:
+   ```bash
+   go build -o pfpcache-relay main.go
+   ```
+
+4. Run the application:
+   ```bash
+   ./pfpcache-relay
+   ```
+
 ## Usage
 
 ### Starting the Relay
@@ -190,13 +261,39 @@ The relay can be configured using a JSON configuration file. The default configu
 | `max_image_size` | The maximum width/height for resized profile images in pixels (default: 200) |
 | `image_quality` | The JPEG quality for resized images (1-100, default: 85) |
 
-## Running
+## Running in Production
 
-```bash
-./run.sh
+For production environments, you may want to:
+
+1. Customize the configuration in `config.json` based on your needs
+2. Use a process manager like systemd, supervisor, or PM2 to keep the service running
+3. Set up a reverse proxy (like Nginx) if you want to expose the service publicly
+
+Example systemd service file (`/etc/systemd/system/pfpcache.service`):
+
+```ini
+[Unit]
+Description=Khatru Profile Picture Cache Relay
+After=network.target
+
+[Service]
+Type=simple
+User=yourusername
+WorkingDirectory=/path/to/pfpcache
+ExecStart=/path/to/pfpcache/pfpcache-relay
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-This will build and start the relay on http://localhost:8080.
+After creating the service file:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pfpcache
+sudo systemctl start pfpcache
+```
 
 ## Example Client
 
